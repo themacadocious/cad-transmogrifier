@@ -1,0 +1,77 @@
+{
+ "name": "slot_plate",
+ "description": "80x40x6 plate with a 30x10 stadium slot",
+ "units": "mm",
+ "volume": 17828.76110196153,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   80.0,
+   40.0,
+   6.0
+  ]
+ },
+ "solids": 1,
+ "faces": 10,
+ "faces_by_type": {
+  "plane": 8,
+  "cylinder": 2,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    32.5,
+    20.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 5.0
+  },
+  {
+   "origin": [
+    47.5,
+    20.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 5.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "slot_plate_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 128,
+   "dropped_degenerate": 0,
+   "mesh_volume": 17833.334496992364,
+   "mesh_volume_error_pct": 0.02565178255897869
+  },
+  "fine": {
+   "file": "slot_plate_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 528,
+   "dropped_degenerate": 0,
+   "mesh_volume": 17828.95634802718,
+   "mesh_volume_error_pct": 0.001095118525250752
+  }
+ }
+}

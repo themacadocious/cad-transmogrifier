@@ -1,0 +1,64 @@
+{
+ "name": "box_hole",
+ "description": "50x40x15 block, one \u00d810 through hole",
+ "units": "mm",
+ "volume": 28821.90275490383,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   50.0,
+   40.0,
+   15.0
+  ]
+ },
+ "solids": 1,
+ "faces": 7,
+ "faces_by_type": {
+  "plane": 6,
+  "cylinder": 1,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    25.0,
+    20.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 5.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "box_hole_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 120,
+   "dropped_degenerate": 0,
+   "mesh_volume": 28833.336020903662,
+   "mesh_volume_error_pct": 0.03966867176348158
+  },
+  "fine": {
+   "file": "box_hole_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 520,
+   "dropped_degenerate": 0,
+   "mesh_volume": 28822.390959151253,
+   "mesh_volume_error_pct": 0.0016938654313537484
+  }
+ }
+}

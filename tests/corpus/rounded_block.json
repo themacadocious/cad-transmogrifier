@@ -1,0 +1,207 @@
+{
+ "name": "rounded_block",
+ "description": "50x40x20 block, all edges R4 (cylinders + corner blends)",
+ "units": "mm",
+ "volume": 38574.91406444588,
+ "bbox": {
+  "min": [
+   -8.881784197001252e-16,
+   -8.881784197001252e-16,
+   -8.881784197001252e-16
+  ],
+  "max": [
+   50.0,
+   40.0,
+   20.0
+  ]
+ },
+ "solids": 1,
+ "faces": 26,
+ "faces_by_type": {
+  "plane": 6,
+  "cylinder": 12,
+  "cone": 0,
+  "sphere": 8,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    3.999999999999999,
+    3.999999999999999,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    3.999999999999999,
+    0.0,
+    3.999999999999999
+   ],
+   "axis": [
+    -0.0,
+    1.0,
+    0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    3.999999999999999,
+    0.0,
+    16.0
+   ],
+   "axis": [
+    -0.0,
+    1.0,
+    0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    3.999999999999999,
+    36.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    0.0,
+    3.999999999999999,
+    3.999999999999999
+   ],
+   "axis": [
+    1.0,
+    0.0,
+    -0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    0.0,
+    3.999999999999999,
+    16.0
+   ],
+   "axis": [
+    1.0,
+    0.0,
+    -0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    46.0,
+    3.999999999999999,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    0.0,
+    36.0,
+    3.999999999999999
+   ],
+   "axis": [
+    1.0,
+    0.0,
+    -0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    46.0,
+    0.0,
+    3.999999999999999
+   ],
+   "axis": [
+    -0.0,
+    1.0,
+    0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    0.0,
+    36.0,
+    16.0
+   ],
+   "axis": [
+    1.0,
+    0.0,
+    -0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    46.0,
+    0.0,
+    16.0
+   ],
+   "axis": [
+    -0.0,
+    1.0,
+    0.0
+   ],
+   "radius": 4.0
+  },
+  {
+   "origin": [
+    46.0,
+    36.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "rounded_block_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 780,
+   "dropped_degenerate": 8,
+   "mesh_volume": 38532.254711726426,
+   "mesh_volume_error_pct": -0.11058832859144349
+  },
+  "fine": {
+   "file": "rounded_block_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 9452,
+   "dropped_degenerate": 8,
+   "mesh_volume": 38572.719589032065,
+   "mesh_volume_error_pct": -0.0056888666301380475
+  }
+ }
+}

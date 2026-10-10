@@ -1,0 +1,90 @@
+{
+ "name": "flanged_shaft",
+ "description": "\u00d840 flange + \u00d816 shaft, R3 torus fillet, \u00d88 bore",
+ "units": "mm",
+ "volume": 14280.081646671691,
+ "bbox": {
+  "min": [
+   -20.0,
+   -20.0,
+   0.0
+  ],
+  "max": [
+   20.0,
+   20.0,
+   38.0
+  ]
+ },
+ "solids": 1,
+ "faces": 7,
+ "faces_by_type": {
+  "plane": 3,
+  "cylinder": 3,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 1,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 20.0
+  },
+  {
+   "origin": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 8.0
+  },
+  {
+   "origin": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "flanged_shaft_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 1030,
+   "dropped_degenerate": 0,
+   "mesh_volume": 14223.725201047027,
+   "mesh_volume_error_pct": -0.39465072412803215
+  },
+  "fine": {
+   "file": "flanged_shaft_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 9636,
+   "dropped_degenerate": 0,
+   "mesh_volume": 14275.165215976267,
+   "mesh_volume_error_pct": -0.03442858953520279
+  }
+ }
+}

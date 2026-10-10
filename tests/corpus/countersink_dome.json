@@ -1,0 +1,64 @@
+{
+ "name": "countersink_dome",
+ "description": "plate with a 90\u00b0 countersunk hole (cone) and R12 hemisphere dome",
+ "units": "mm",
+ "volume": 38118.55430746347,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   70.0,
+   50.0,
+   22.0
+  ]
+ },
+ "solids": 1,
+ "faces": 9,
+ "faces_by_type": {
+  "plane": 6,
+  "cylinder": 1,
+  "cone": 1,
+  "sphere": 1,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    18.0,
+    25.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "countersink_dome_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 890,
+   "dropped_degenerate": 1,
+   "mesh_volume": 38082.81429342812,
+   "mesh_volume_error_pct": -0.09376015088891118
+  },
+  "fine": {
+   "file": "countersink_dome_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 7506,
+   "dropped_degenerate": 1,
+   "mesh_volume": 38114.74688357971,
+   "mesh_volume_error_pct": -0.009988374304669105
+  }
+ }
+}

@@ -1,0 +1,64 @@
+{
+ "name": "two_bodies",
+ "description": "two disjoint solids: box and cylinder",
+ "units": "mm",
+ "volume": 15283.185307179585,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   70.0,
+   30.0,
+   20.0
+  ]
+ },
+ "solids": 2,
+ "faces": 9,
+ "faces_by_type": {
+  "plane": 8,
+  "cylinder": 1,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    60.0,
+    15.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 10.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "two_bodies_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 136,
+   "dropped_degenerate": 0,
+   "mesh_volume": 15242.890625206783,
+   "mesh_volume_error_pct": -0.2636536897440677
+  },
+  "fine": {
+   "file": "two_bodies_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 512,
+   "dropped_degenerate": 0,
+   "mesh_volume": 15280.581693273234,
+   "mesh_volume_error_pct": -0.017035806698801864
+  }
+ }
+}

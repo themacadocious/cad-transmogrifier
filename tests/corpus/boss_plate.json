@@ -1,0 +1,64 @@
+{
+ "name": "boss_plate",
+ "description": "60x60x6 plate with \u00d820x20 boss",
+ "units": "mm",
+ "volume": 27883.185307179585,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   60.0,
+   60.0,
+   26.0
+  ]
+ },
+ "solids": 1,
+ "faces": 8,
+ "faces_by_type": {
+  "plane": 7,
+  "cylinder": 1,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    30.0,
+    30.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 10.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "boss_plate_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 140,
+   "dropped_degenerate": 0,
+   "mesh_volume": 27842.890893544467,
+   "mesh_volume_error_pct": -0.14451151542124074
+  },
+  "fine": {
+   "file": "boss_plate_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 516,
+   "dropped_degenerate": 0,
+   "mesh_volume": 27880.581663717425,
+   "mesh_volume_error_pct": -0.009337683028236019
+  }
+ }
+}

@@ -5,9 +5,12 @@ Pipeline (same idea as Fusion 360's "Mesh to BRep"):
   1. parse STL, weld duplicate vertices, drop degenerate triangles
   2. build an OpenCASCADE shell with *shared* edges (no slow sewing pass)
   3. close it into a solid and fix its orientation
-  4. merge coplanar triangles into single planar faces (the "prismatic" step
-     that makes the result actually editable — a cube becomes 6 faces, not 12)
+  4. merge coplanar triangles into single planar faces (a cube becomes 6 faces, not 12)
   5. write STEP (or IGES / BREP)
+
+By default it first tries a "prismatic" rebuild (segment.py + rebuild.py): planes,
+cylinders, cones, spheres and tori are recognised and rebuilt as true analytic faces, so
+a hole is one cylinder you can resize. If that fails validation it falls back to 1-4.
 """
 
 import argparse
@@ -212,7 +215,8 @@ def write(shape, out, name):
         raise RuntimeError(f"failed to write {out}")
 
 
-def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log):
+def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
+            prismatic=True, fit_tol=None):
     src = Path(src)
     out = Path(out) if out else src.with_suffix(".step")
     t0 = time.time()
@@ -223,6 +227,12 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log):
     points, faces, dropped = weld(tris, tol)
     progress(f"{src.name}: {len(tris)} triangles, {len(points)} vertices"
              + (f", dropped {dropped} degenerate/duplicate" if dropped else ""))
+
+    shape = None
+    if merge and prismatic:
+        shape = prismatic_rebuild(points, faces, fit_tol or max(diag * 2e-5, 1e-3), angle, tol, progress)
+    if shape is not None:
+        return _finish(shape, True, src, out, t0, progress)
 
     shell, failed = build_shell(points, faces)
     if failed:
@@ -236,6 +246,41 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log):
         shape = merge_coplanar(shape, angle, tol * 10)
         progress(f"  merged coplanar faces: {n_before} -> {count_faces(shape)}")
 
+    return _finish(shape, is_solid, src, out, t0, progress)
+
+
+def prismatic_rebuild(points, faces, fit_tol, angle, tol, progress):
+    """Recognise planes/cylinders and rebuild true analytic faces. None if it can't."""
+    try:
+        import rebuild
+        import segment
+
+        labels, surfaces = segment.segment(points, faces, fit_tol, angle)
+        shape = rebuild.rebuild(points, faces, labels, surfaces, fit_tol)
+    except Exception as e:  # never worse than faceted: any failure falls back
+        progress(f"  prismatic rebuild not possible ({type(e).__name__}: {e}); using faceted conversion")
+        return None
+    # coplanar facets the segmenter left apart, coaxial cylinder pieces, etc.
+    merged = merge_coplanar(shape, angle, tol * 10)
+    if BRepCheck_Analyzer(merged).IsValid():
+        shape = merged
+    kinds = face_types(shape)
+    progress("  prismatic: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + " faces")
+    return shape
+
+
+def face_types(shape):
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+
+    kinds, exp = {}, TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        k = BRepAdaptor_Surface(TopoDS.Face(exp.Current())).GetType().name.removeprefix("GeomAbs_").lower()
+        kinds[k] = kinds.get(k, 0) + 1
+        exp.Next()
+    return kinds
+
+
+def _finish(shape, is_solid, src, out, t0, progress):
     if is_solid:
         valid = BRepCheck_Analyzer(shape).IsValid()
         progress(f"  solid volume {volume(shape):.3f} mm^3, "
@@ -255,9 +300,10 @@ def gui():
 
     root = tk.Tk()
     root.title("STL → STEP")
-    root.geometry("640x420")
+    root.geometry("820x420")
 
     merge = tk.BooleanVar(value=True)
+    prismatic = tk.BooleanVar(value=True)
     angle = tk.DoubleVar(value=0.5)
     fmt = tk.StringVar(value=".step")
 
@@ -266,6 +312,7 @@ def gui():
     btn = ttk.Button(bar, text="Open STL(s)…")
     btn.pack(side="left")
     ttk.Checkbutton(bar, text="Merge coplanar faces", variable=merge).pack(side="left", padx=10)
+    ttk.Checkbutton(bar, text="Recognise holes/cylinders", variable=prismatic).pack(side="left")
     ttk.Label(bar, text="angle°").pack(side="left")
     ttk.Spinbox(bar, from_=0.01, to=10, increment=0.25, width=5, textvariable=angle).pack(side="left")
     ttk.Combobox(bar, values=[".step", ".iges", ".brep"], textvariable=fmt, width=6,
@@ -280,7 +327,8 @@ def gui():
     def run(paths):
         for p in paths:
             try:
-                convert(p, Path(p).with_suffix(fmt.get()), merge.get(), angle.get(), progress=say)
+                convert(p, Path(p).with_suffix(fmt.get()), merge.get(), angle.get(), progress=say,
+                        prismatic=prismatic.get())
             except Exception as e:  # keep going with the rest of the batch
                 say(f"  ERROR: {e}")
         say("done.\n")
@@ -304,6 +352,10 @@ def main():
     ap.add_argument("--no-merge", action="store_true", help="keep every triangle as its own face")
     ap.add_argument("--angle", type=float, default=0.5,
                     help="max angle in degrees between triangles merged into one face (default 0.5)")
+    ap.add_argument("--faceted", action="store_true",
+                    help="skip cylinder/plane recognition; only merge coplanar triangles")
+    ap.add_argument("--fit-tol", type=float,
+                    help="max deviation in mm for a vertex to count as on a plane/cylinder (default: auto)")
     ap.add_argument("--weld", type=float, help="vertex weld tolerance in mm (default: auto)")
     args = ap.parse_args()
 
@@ -314,7 +366,8 @@ def main():
     rc = 0
     for src in args.inputs:
         try:
-            convert(src, args.output, not args.no_merge, args.angle, args.weld)
+            convert(src, args.output, not args.no_merge, args.angle, args.weld,
+                    prismatic=not args.faceted, fit_tol=args.fit_tol)
         except Exception as e:
             log(f"{src}: ERROR: {e}")
             rc = 1

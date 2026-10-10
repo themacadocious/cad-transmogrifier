@@ -1,0 +1,77 @@
+{
+ "name": "tube",
+ "description": "\u00d830/\u00d820 tube, 50 long",
+ "units": "mm",
+ "volume": 19634.95408493621,
+ "bbox": {
+  "min": [
+   -15.0,
+   -15.0,
+   0.0
+  ],
+  "max": [
+   15.0,
+   15.0,
+   50.0
+  ]
+ },
+ "solids": 1,
+ "faces": 4,
+ "faces_by_type": {
+  "plane": 2,
+  "cylinder": 2,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 15.0
+  },
+  {
+   "origin": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 10.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "tube_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 284,
+   "dropped_degenerate": 0,
+   "mesh_volume": 19582.99928070452,
+   "mesh_volume_error_pct": -0.2646036451470418
+  },
+  "fine": {
+   "file": "tube_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 1008,
+   "dropped_degenerate": 0,
+   "mesh_volume": 19626.817478298326,
+   "mesh_volume_error_pct": -0.0414393973252302
+  }
+ }
+}

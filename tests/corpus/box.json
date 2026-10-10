@@ -1,0 +1,50 @@
+{
+ "name": "box",
+ "description": "plain 40x30x20 box",
+ "units": "mm",
+ "volume": 24000.0,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   40.0,
+   30.0,
+   20.0
+  ]
+ },
+ "solids": 1,
+ "faces": 6,
+ "faces_by_type": {
+  "plane": 6,
+  "cylinder": 0,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [],
+ "meshes": {
+  "coarse": {
+   "file": "box_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 12,
+   "dropped_degenerate": 0,
+   "mesh_volume": 24000.0,
+   "mesh_volume_error_pct": 0.0
+  },
+  "fine": {
+   "file": "box_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 12,
+   "dropped_degenerate": 0,
+   "mesh_volume": 24000.0,
+   "mesh_volume_error_pct": 0.0
+  }
+ }
+}

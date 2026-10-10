@@ -1,0 +1,90 @@
+{
+ "name": "l_bracket",
+ "description": "L-bracket, R5 inner fillet, 2x \u00d86 holes",
+ "units": "mm",
+ "volume": 24835.30983001486,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   60.0,
+   40.0,
+   50.0
+  ]
+ },
+ "solids": 1,
+ "faces": 11,
+ "faces_by_type": {
+  "plane": 8,
+  "cylinder": 3,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    11.0,
+    0.0,
+    11.0
+   ],
+   "axis": [
+    -0.0,
+    1.0,
+    0.0
+   ],
+   "radius": 5.0
+  },
+  {
+   "origin": [
+    35.0,
+    28.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  },
+  {
+   "origin": [
+    35.0,
+    12.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "l_bracket_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 264,
+   "dropped_degenerate": 0,
+   "mesh_volume": 24845.177524435338,
+   "mesh_volume_error_pct": 0.03973251990016414
+  },
+  "fine": {
+   "file": "l_bracket_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 1164,
+   "dropped_degenerate": 0,
+   "mesh_volume": 24835.76582243187,
+   "mesh_volume_error_pct": 0.0018360649419349947
+  }
+ }
+}

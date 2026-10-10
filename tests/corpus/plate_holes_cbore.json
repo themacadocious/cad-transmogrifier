@@ -1,0 +1,129 @@
+{
+ "name": "plate_holes_cbore",
+ "description": "80x60x8 plate, 4x \u00d86 holes, \u00d88 hole with \u00d816x4 counterbore",
+ "units": "mm",
+ "volume": 36489.9116666174,
+ "bbox": {
+  "min": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "max": [
+   80.0,
+   60.0,
+   8.0
+  ]
+ },
+ "solids": 1,
+ "faces": 13,
+ "faces_by_type": {
+  "plane": 7,
+  "cylinder": 6,
+  "cone": 0,
+  "sphere": 0,
+  "torus": 0,
+  "bspline": 0,
+  "other": 0
+ },
+ "cylinders": [
+  {
+   "origin": [
+    8.0,
+    8.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  },
+  {
+   "origin": [
+    72.0,
+    8.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  },
+  {
+   "origin": [
+    8.0,
+    52.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  },
+  {
+   "origin": [
+    40.0,
+    30.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 8.0
+  },
+  {
+   "origin": [
+    72.0,
+    52.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 3.0
+  },
+  {
+   "origin": [
+    40.0,
+    30.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "radius": 4.0
+  }
+ ],
+ "meshes": {
+  "coarse": {
+   "file": "plate_holes_cbore_coarse.stl",
+   "linear_deflection": 0.1,
+   "angular_deflection": 0.5,
+   "triangles": 668,
+   "dropped_degenerate": 0,
+   "mesh_volume": 36506.92144666766,
+   "mesh_volume_error_pct": 0.046615021175336696
+  },
+  "fine": {
+   "file": "plate_holes_cbore_fine.stl",
+   "linear_deflection": 0.01,
+   "angular_deflection": 0.1,
+   "triangles": 3056,
+   "dropped_degenerate": 0,
+   "mesh_volume": 36490.7031364154,
+   "mesh_volume_error_pct": 0.002169009903976874
+  }
+ }
+}
