@@ -309,8 +309,8 @@ def gui():
     btn = ttk.Button(bar, text="Open STL(s)…")
     btn.pack(side="left")
     ttk.Checkbutton(bar, text="Merge coplanar faces", variable=merge).pack(side="left", padx=10)
-    ttk.Checkbutton(bar, text="Recognise holes/cylinders", variable=prismatic).pack(side="left")
-    ttk.Label(bar, text="angle°").pack(side="left")
+    ttk.Checkbutton(bar, text="Recognise curved surfaces", variable=prismatic).pack(side="left")
+    ttk.Label(bar, text="merge angle°").pack(side="left", padx=(12, 2))
     ttk.Spinbox(bar, from_=0.01, to=10, increment=0.25, width=5, textvariable=angle).pack(side="left")
     ttk.Combobox(bar, values=[".step", ".iges", ".brep"], textvariable=fmt, width=6,
                  state="readonly").pack(side="left", padx=10)
