@@ -41,7 +41,10 @@ from OCP.Geom import (
     Geom_ToroidalSurface,
 )
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
+from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
+from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
+from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shell, TopoDS_Solid
 from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 
@@ -307,6 +310,10 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
 
     if not BRepCheck_Analyzer(shape).IsValid():
         raise RebuildError("rebuilt solid fails BRepCheck")
+    # a valid compound of open shells still integrates to the right volume, so check
+    # explicitly that every face ended up inside a solid
+    if count_solid_faces(shape) != count_all_faces(shape):
+        raise RebuildError("rebuild produced open shells, not solids")
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, props)
     want = mesh_volume(points, faces)
@@ -487,6 +494,7 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
     # consistently, so the shells are assembled directly (ShapeFix_Shell's orientation
     # pass flips full-turn hole cylinders, whose UV boundary looks ambiguous to it)
     body = _bodies(faces, he)
+    reshape = ShapeBuild_ReShape()
     builder = BRep_Builder()
     shells = {}
 
@@ -520,7 +528,7 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
                 raise RebuildError(f"wire failed for region {r} ({mw.Error()})")
             wires.append((mw.Wire(), loop))
 
-        face = _make_face(surf, wires, points, faces, labels, r, tol)
+        face = _make_face(surf, wires, points, faces, labels, r, tol, reshape)
         b = int(body[np.nonzero(labels == r)[0][0]])
         if b not in shells:
             shells[b] = TopoDS_Shell()
@@ -541,9 +549,30 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
         builder.MakeCompound(solid)
         for so in solids:
             builder.Add(solid, so)
+    solid = reshape.Apply(solid)
     final = ShapeFix_Shape(solid)
     final.Perform()
     return final.Shape()
+
+
+def _count(shape, kind):
+    n, exp = 0, TopExp_Explorer(shape, kind)
+    while exp.More():
+        n += 1
+        exp.Next()
+    return n
+
+
+def count_all_faces(shape):
+    return _count(shape, TopAbs_FACE)
+
+
+def count_solid_faces(shape):
+    n, exp = 0, TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        n += _count(exp.Current(), TopAbs_FACE)
+        exp.Next()
+    return n
 
 
 def _bodies(faces, he):
@@ -597,7 +626,7 @@ def _chain_starts_here(loop, i, half_to_chain, chains):
     return a == (path[0] if fwd else path[-1])
 
 
-def _make_face(surf, wires, points, faces, labels, r, tol):
+def _make_face(surf, wires, points, faces, labels, r, tol, reshape):
     if surf is None:
         # freeform triangle: its own plane
         t = faces[np.nonzero(labels == r)[0][0]]
@@ -621,9 +650,7 @@ def _make_face(surf, wires, points, faces, labels, r, tol):
             mk.Add(wires[i][0])
         if not mk.IsDone():
             raise RebuildError(f"planar face failed for region {r}")
-        fx = ShapeFix_Face(mk.Face())
-        fx.Perform()
-        return TopoDS.Face(fx.Face())
+        return _fix_face(mk.Face(), tol, reshape)
 
     # cylinder/cone: build on a surface whose natural normal matches the material normal,
     # so the mesh-derived wire orientation is already right. A left-handed frame
@@ -658,7 +685,16 @@ def _make_face(surf, wires, points, faces, labels, r, tol):
     b.MakeFace(face, geom, tol)
     for w, _ in wires:
         b.Add(face, w)
+    return _fix_face(face, tol, reshape)
+
+
+def _fix_face(face, tol, reshape):
+    """ShapeFix_Face (pcurves, seams) — but it replaces the face's edges with copies, which
+    would disconnect the face from its neighbours. Recording the replacements in a shared
+    ReShape context and applying that to the whole shell afterwards keeps edges shared.
+    Returns the ORIGINAL face; the context maps it to the fixed one."""
     fx = ShapeFix_Face(face)
+    fx.SetContext(reshape)
     fx.SetPrecision(tol)
     fx.Perform()
-    return TopoDS.Face(fx.Face())
+    return face

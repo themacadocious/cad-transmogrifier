@@ -262,7 +262,8 @@ def prismatic_rebuild(points, faces, fit_tol, angle, tol, progress):
         return None
     # coplanar facets the segmenter left apart, coaxial cylinder pieces, etc.
     merged = merge_coplanar(shape, angle, tol * 10)
-    if BRepCheck_Analyzer(merged).IsValid():
+    if BRepCheck_Analyzer(merged).IsValid() \
+            and rebuild.count_solid_faces(merged) == rebuild.count_all_faces(merged):
         shape = merged
     kinds = face_types(shape)
     progress("  prismatic: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + " faces")

@@ -17,6 +17,7 @@ above --max-vol-err (default 1%) against the true B-rep volume.
 
 import argparse
 import importlib
+import importlib.util
 import inspect
 import json
 import sys
@@ -54,7 +55,6 @@ def load_impl(spec):
         sys.path.insert(0, str(ROOT))
     mod, _, fn = spec.rpartition(":") if spec.count(":") else (spec, "", "")
     if mod.endswith(".py"):  # path/to/file.py:function — e.g. a baseline copy of an old version
-        import importlib.util
         s = importlib.util.spec_from_file_location(Path(mod).stem, mod)
         module = importlib.util.module_from_spec(s)
         sys.modules[s.name] = module
