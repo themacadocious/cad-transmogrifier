@@ -141,9 +141,15 @@ def _half_edges(faces):
     return he
 
 
-def _boundary_loops(faces, region, he, labels):
+def _region_index(labels):
+    """{region: triangle indices}, built in one pass (per-region scans are O(n^2))."""
+    order = np.argsort(labels, kind="stable")
+    regions, starts = np.unique(labels[order], return_index=True)
+    return dict(zip(regions.tolist(), np.split(order, starts[1:])))
+
+
+def _boundary_loops(faces, region, tris, he, labels):
     """Directed boundary half-edges of one region, linked into closed loops (vertex lists)."""
-    tris = np.nonzero(labels == region)[0]
     out = {}
     for t in tris.tolist():
         tri = faces[t]
@@ -544,9 +550,9 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     shells = {}
     made = []
 
-    for r in np.unique(labels).tolist():
+    for r, tris in _region_index(labels).items():
         surf = surfaces[r]
-        loops = _boundary_loops(faces, r, he, labels)
+        loops = _boundary_loops(faces, r, tris, he, labels)
         wires = []
         for loop in loops:
             mw = BRepBuilderAPI_MakeWire()
@@ -574,9 +580,9 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
                 raise _ChainError(f"wire failed for region {r} ({mw.Error()})", (r,))
             wires.append((mw.Wire(), loop))
 
-        face = _make_face(surf, wires, points, faces, labels, r, tol, reshape)
+        face = _make_face(surf, wires, points, faces, tris, tol, reshape)
         made.append((r, face))
-        b = int(body[np.nonzero(labels == r)[0][0]])
+        b = int(body[tris[0]])
         if b not in shells:
             shells[b] = TopoDS_Shell()
             builder.MakeShell(shells[b])
@@ -717,10 +723,10 @@ def _chain_starts_here(loop, i, half_to_chain, chains):
     return a == (path[0] if fwd else path[-1])
 
 
-def _make_face(surf, wires, points, faces, labels, r, tol, reshape):
+def _make_face(surf, wires, points, faces, tris, tol, reshape):
     if surf is None:
         # freeform triangle: its own plane
-        t = faces[np.nonzero(labels == r)[0][0]]
+        t = faces[tris[0]]
         p = points[t]
         n = np.cross(p[1] - p[0], p[2] - p[0])
         surf_pln = gp_Pln(_pnt(p[0]), _dir(n / np.linalg.norm(n)))
@@ -740,13 +746,13 @@ def _make_face(surf, wires, points, faces, labels, r, tol, reshape):
         for i in order[1:]:
             mk.Add(wires[i][0])
         if not mk.IsDone():
-            raise RebuildError(f"planar face failed for region {r}")
+            raise RebuildError("planar face failed")
         return _fix_face(mk.Face(), tol, reshape)
 
     # cylinder/cone: build on a surface whose natural normal matches the material normal,
     # so the mesh-derived wire orientation is already right. A left-handed frame
     # (YReverse) flips the natural normal to point at the axis, for holes/countersinks.
-    region_pts = points[faces[labels == r]].reshape(-1, 3)
+    region_pts = points[faces[tris]].reshape(-1, 3)
     k = _kind(surf)
     if k == "sphere":
         # put the poles and the seam away from the patch: axis across it, seam behind it
