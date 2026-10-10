@@ -39,6 +39,7 @@ from OCP.Geom import (
     Geom_Plane,
     Geom_SphericalSurface,
     Geom_ToroidalSurface,
+    Geom_TrimmedCurve,
 )
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
 from OCP.ShapeBuild import ShapeBuild_ReShape
@@ -51,6 +52,14 @@ from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 
 class RebuildError(Exception):
     pass
+
+
+class _ChainError(RebuildError):
+    """An edge between two regions couldn't be built; demote their curved surfaces."""
+
+    def __init__(self, msg, regions):
+        super().__init__(msg)
+        self.regions = regions
 
 
 def _kind(s):
@@ -234,16 +243,19 @@ def _intersection_curve(pts, sa, sb, tol):
         return None
     if not inter.IsDone():
         return None
-    probe = pts[[0, len(pts) // 2, -1]] if len(pts) > 2 else pts
     for i in range(1, inter.NbLines() + 1):
         c = inter.Line(i)
+        # IntSS hands back trimmed copies; trimming/reversing those misbehaves across the
+        # trim boundary, so work on the underlying (periodic) ellipse/circle/line
+        if isinstance(c, Geom_TrimmedCurve):  # OCP returns handles as their concrete type
+            c = c.BasisCurve()
         ok = True
         for q in pts if len(pts) <= 64 else pts[:: max(1, len(pts) // 64)]:
             pr = GeomAPI_ProjectPointOnCurve(_pnt(q), c)
             if pr.NbPoints() == 0 or pr.LowerDistance() > tol:
                 ok = False
                 break
-        if ok and len(probe):
+        if ok:
             return c
     return None
 
@@ -261,8 +273,8 @@ def _chain_geom(pts, sa, sb, tol, closed):
             return ("line",)
     if not curved:
         return ("poly",)
-    if len(pts) < 3:
-        return None
+    # from here the curve comes from the surfaces, so even a single mesh edge (2 points)
+    # is enough; only the free circle fit below needs real support
     c0 = curved[0]
     circ = _circle_for(pts, c0, tol) if _kind(c0) in ("cylinder", "cone") else None
     if circ is not None and on_both() and all(
@@ -295,18 +307,29 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     labels[free] = len(surfaces) + np.arange(len(free))
     surfaces += [None] * len(free)
 
-    for _ in range(max_rounds):
-        chains, demote = _build_chains(points, faces, labels, surfaces, he, tol)
-        if not demote:
-            break
-        for r in demote:
+    _split_wrapping(points, faces, labels, surfaces)
+
+    def demote(regions):
+        for r in regions:
             tris = np.nonzero(labels == r)[0]
             labels[tris] = len(surfaces) + np.arange(len(tris))
-            surfaces += [None] * len(tris)
+            surfaces.extend([None] * len(tris))
+
+    for _ in range(max_rounds):
+        chains, bad = _build_chains(points, faces, labels, surfaces, he, tol)
+        if bad:
+            demote(bad)
+            continue
+        try:
+            shape = _assemble(points, faces, labels, surfaces, he, chains, tol)
+            break
+        except _ChainError as e:
+            curved = [r for r in e.regions if _is_curved(surfaces[r])]
+            if not curved:
+                raise
+            demote(curved)
     else:
         raise RebuildError("chain classification did not converge")
-
-    shape = _assemble(points, faces, labels, surfaces, he, chains, tol)
 
     if not BRepCheck_Analyzer(shape).IsValid():
         raise RebuildError("rebuilt solid fails BRepCheck")
@@ -320,6 +343,43 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     if want <= 0 or abs(props.Mass() - want) / want > 0.02:
         raise RebuildError(f"volume mismatch: rebuilt {props.Mass():.3f} vs mesh {want:.3f}")
     return shape
+
+
+def _split_wrapping(points, faces, labels, surfaces):
+    """Split curved regions that wrap all the way round their axis into two halves.
+
+    A face whose boundary loops each circle the axis needs a seam edge joining them, and
+    ShapeFix_Face only manages that for plain circular ends (not ellipses, notches...).
+    Two half-shells need no seam at all; the final same-domain merge rejoins them into
+    one face. Triangles are split by centroid angle, which for the usual column-wise
+    tessellation puts the cut along straight axial mesh edges."""
+    for r in range(len(surfaces)):
+        s = surfaces[r]
+        if _kind(s) not in ("cylinder", "cone", "torus"):
+            continue
+        tris = np.nonzero(labels == r)[0]
+        if len(tris) < 4:
+            continue
+        origin = s.center if _kind(s) == "torus" else s.origin
+        c = points[faces[tris]].mean(axis=1) - origin
+        x = np.cross(s.axis, [1.0, 0, 0] if abs(s.axis[0]) < 0.9 else [0, 1.0, 0])
+        x /= np.linalg.norm(x)
+        y = np.cross(s.axis, x)
+        ang = np.sort(np.arctan2(c @ y, c @ x))
+        gaps = np.diff(np.concatenate([ang, ang[:1] + 2 * np.pi]))
+        if gaps.max() > np.pi / 2:  # an open arc (fillet, partial wall): no seam trouble
+            continue
+        # cut in the gaps between triangle centroids — between facet columns, i.e. along
+        # axial mesh edges — once at the widest gap and once at the gap nearest opposite
+        mids = (ang + gaps / 2) % (2 * np.pi)
+        cut1 = mids[np.argmax(gaps)]
+        cut2 = mids[np.argmin(np.abs(((mids - cut1) % (2 * np.pi)) - np.pi))]
+        theta = np.arctan2(c @ y, c @ x)
+        half = (theta - cut1) % (2 * np.pi) < (cut2 - cut1) % (2 * np.pi)
+        if half.all() or not half.any():
+            continue
+        labels[tris[half]] = len(surfaces)
+        surfaces.append(s)
 
 
 def _build_chains(points, faces, labels, surfaces, he, tol):
@@ -443,53 +503,38 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
     half_to_chain = {}  # directed mesh edge -> (chain index, forward?)
     chain_edges = []
     for ci, ((ra, rb), path, geom) in enumerate(chains):
-        kind = geom[0]
-        if kind == "line":
-            es = [BRepBuilderAPI_MakeEdge(vertex(path[0]), vertex(path[-1])).Edge()]
-        elif kind == "circle":
-            _, centre, axis, radius = geom
-            p0 = P(path[0])
-            x = p0 - centre
-            x -= (x @ axis) * axis
-            x /= np.linalg.norm(x)
-            # pick the circle sense so the arc passes through the chain's middle point
-            mid = points[path[len(path) // 2]] - centre
-            y = np.cross(axis, x)
-            ang_mid = np.arctan2(mid @ y, mid @ x) % (2 * np.pi)
-            if path[0] == path[-1]:
-                second = points[path[1]] - centre
-                forward = (np.arctan2(second @ y, second @ x) % (2 * np.pi)) < np.pi
-            else:
-                end = P(path[-1]) - centre
-                ang_end = np.arctan2(end @ y, end @ x) % (2 * np.pi)
-                forward = ang_mid < ang_end
-            ax = axis if forward else -axis
-            circ = Geom_Circle(gp_Circ(gp_Ax2(_pnt(centre), _dir(ax), _dir(x)), float(radius)))
-            if path[0] == path[-1]:
-                u1 = 2 * np.pi
-            else:
-                u1 = ang_end if forward else 2 * np.pi - ang_end
-            # the corners were snapped onto the surfaces, not onto this fitted circle, so
-            # let the vertices absorb the small gap instead of failing point projection
-            v0, v1 = vertex(path[0]), vertex(path[-1])
-            for v, u in ((v0, 0.0), (v1, u1)):
-                gap = circ.Value(float(u)).Distance(BRep_Tool.Pnt_s(v))
-                if gap > BRep_Tool.Tolerance_s(v):
-                    BRep_Builder().UpdateVertex(v, gap * 1.01)
-            mk = BRepBuilderAPI_MakeEdge(circ, v0, v1, 0.0, float(u1))
-            if not mk.IsDone():
-                raise RebuildError(f"arc edge failed ({mk.Error()})")
-            es = [mk.Edge()]
-        elif kind == "curve":
-            es = [_curve_edge(geom[1], vertex(path[0]), vertex(path[-1]), P(path[0]), P(path[-1]),
-                              points[path[len(path) // 2]], path[0] == path[-1])]
-        else:
-            es = [BRepBuilderAPI_MakeEdge(vertex(a), vertex(b)).Edge() for a, b in zip(path, path[1:])]
+        try:
+            es = _chain_edges(geom, path, points, vertex, P)
+        except RebuildError as e:
+            raise _ChainError(str(e), (ra, rb)) from e
         chain_edges.append(es)
         for a, b in zip(path, path[1:]):
             half_to_chain[(a, b)] = (ci, True)
             half_to_chain[(b, a)] = (ci, False)
+    return _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges,
+                            half_to_chain, tol)
 
+
+def _chain_edges(geom, path, points, vertex, P):
+    """The TopoDS edges for one chain, oriented along its path."""
+    kind = geom[0]
+    if kind == "line":
+        es = [BRepBuilderAPI_MakeEdge(vertex(path[0]), vertex(path[-1])).Edge()]
+    elif kind == "circle":
+        _, centre, axis, radius = geom
+        x = P(path[0]) - centre
+        x -= (x @ axis) * axis
+        x /= np.linalg.norm(x)
+        circ = Geom_Circle(gp_Circ(gp_Ax2(_pnt(centre), _dir(axis), _dir(x)), float(radius)))
+        es = [_trimmed_edge(circ, path, points, vertex, P)]
+    elif kind == "curve":
+        es = [_trimmed_edge(geom[1], path, points, vertex, P)]
+    else:
+        es = [BRepBuilderAPI_MakeEdge(vertex(a), vertex(b)).Edge() for a, b in zip(path, path[1:])]
+    return es
+
+
+def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, half_to_chain, tol):
     # one shell per connected body; the mesh winding already orients every face
     # consistently, so the shells are assembled directly (ShapeFix_Shell's orientation
     # pass flips full-turn hole cylinders, whose UV boundary looks ambiguous to it)
@@ -497,6 +542,7 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
     reshape = ShapeBuild_ReShape()
     builder = BRep_Builder()
     shells = {}
+    made = []
 
     for r in np.unique(labels).tolist():
         surf = surfaces[r]
@@ -525,10 +571,11 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
                         mw.Add(TopoDS.Edge(e.Reversed()))
                 i += len(path) - 1
             if not mw.IsDone():
-                raise RebuildError(f"wire failed for region {r} ({mw.Error()})")
+                raise _ChainError(f"wire failed for region {r} ({mw.Error()})", (r,))
             wires.append((mw.Wire(), loop))
 
         face = _make_face(surf, wires, points, faces, labels, r, tol, reshape)
+        made.append((r, face))
         b = int(body[np.nonzero(labels == r)[0][0]])
         if b not in shells:
             shells[b] = TopoDS_Shell()
@@ -550,6 +597,20 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
         for so in solids:
             builder.Add(solid, so)
     solid = reshape.Apply(solid)
+
+    # a face that came out invalid is almost always a curved surface whose boundary
+    # didn't sit well on it (or a plane next to one): demote those and let rebuild() retry
+    neighbours = defaultdict(set)
+    for (ra, rb), _, _ in chains:
+        neighbours[ra].add(rb)
+        neighbours[rb].add(ra)
+    blame = set()
+    for r, f in made:
+        if not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
+            blame.update(x for x in {r} | neighbours[r] if _is_curved(surfaces[x]))
+    if blame:
+        raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
+
     final = ShapeFix_Shape(solid)
     final.Perform()
     return final.Shape()
@@ -592,21 +653,51 @@ def _bodies(faces, he):
     return np.array([find(t) for t in range(len(faces))])
 
 
-def _curve_edge(curve, v0, v1, p0, p1, pmid, closed):
-    """Edge along `curve` from p0 to p1 passing through pmid (reversing the curve if needed)."""
+def _polyline_dist(q, poly):
+    """Distance from each point in q to the polyline poly."""
+    a, b = poly[:-1], poly[1:]
+    ab = b - a
+    t = np.clip(np.einsum("qij,ij->qi", q[:, None] - a, ab) / np.maximum((ab * ab).sum(1), 1e-30), 0, 1)
+    closest = a + t[..., None] * ab
+    return np.linalg.norm(q[:, None] - closest, axis=2).min(axis=1)
+
+
+def _trimmed_edge(curve, path, points, vertex, P):
+    """Edge along `curve` between the chain's end vertices, running the way the mesh chain
+    runs. Both senses are tried and checked against the chain polyline, so a wrong guess
+    (the long way round a circle, the wrong branch of an ellipse) can't slip through."""
+    closed = path[0] == path[-1]
+    poly = np.array([P(v) for v in path])
+    seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+    limit = 0.5 * seg.max() + 1e-6
+    p0, p1 = P(path[0]), P(path[-1])
+    best = None
     for c in (curve, curve.Reversed()):
         u0 = GeomAPI_ProjectPointOnCurve(_pnt(p0), c).LowerDistanceParameter()
-        um = GeomAPI_ProjectPointOnCurve(_pnt(pmid), c).LowerDistanceParameter()
         u1 = GeomAPI_ProjectPointOnCurve(_pnt(p1), c).LowerDistanceParameter()
         if c.IsPeriodic():
             T = c.Period()
-            um = u0 + (um - u0) % T
             u1 = u0 + T if closed else u0 + (u1 - u0) % T
-        if u0 < um < u1:
-            mk = BRepBuilderAPI_MakeEdge(c, v0, v1, u0, u1)
-            if mk.IsDone():
-                return mk.Edge()
-    raise RebuildError("could not trim intersection curve")
+        if u1 <= u0:
+            continue
+        samples = np.array([c.Value(float(u)).Coord() for u in np.linspace(u0, u1, 9)[1:-1]])
+        err = _polyline_dist(samples, poly).max()
+        if best is None or err < best[0]:
+            best = (err, c, u0, u1)
+    if best is None or best[0] > limit:
+        raise RebuildError("curve does not follow the mesh boundary")
+    _, c, u0, u1 = best
+    v0, v1 = vertex(path[0]), vertex(path[-1])
+    # corners were snapped onto the surfaces, not onto this curve: let the vertices
+    # absorb the small gap instead of failing point projection
+    for v, u in ((v0, u0), (v1, u1)):
+        gap = c.Value(float(u)).Distance(BRep_Tool.Pnt_s(v))
+        if gap > BRep_Tool.Tolerance_s(v):
+            BRep_Builder().UpdateVertex(v, gap * 1.01)
+    mk = BRepBuilderAPI_MakeEdge(c, v0, v1, float(u0), float(u1))
+    if not mk.IsDone():
+        raise RebuildError(f"curve edge failed ({mk.Error()})")
+    return mk.Edge()
 
 
 def _seam_dir(pts, origin, axis):
