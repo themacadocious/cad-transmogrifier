@@ -30,6 +30,7 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeWire,
 )
 from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.BRepLib import BRepLib
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.Geom import (
@@ -41,13 +42,15 @@ from OCP.Geom import (
     Geom_ToroidalSurface,
     Geom_TrimmedCurve,
 )
+from OCP.Geom2d import Geom2d_Line
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
+from OCP.ShapeAnalysis import ShapeAnalysis_Surface
 from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shell, TopoDS_Solid
-from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
+from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Dir2d, gp_Pln, gp_Pnt, gp_Pnt2d
 
 
 class RebuildError(Exception):
@@ -270,6 +273,10 @@ def _chain_geom(pts, sa, sb, tol, closed):
     """Decide the curve for a chain between surfaces sa and sb.
     Returns ('line',) | ('circle', centre, axis, radius) | ('curve', Geom_Curve) | ('poly',)
     or None when the chain can't lie on a curved neighbour (that neighbour gets demoted)."""
+    if sa is sb and _is_curved(sa):
+        # the cut between the two halves of a split region: any curve on the surface
+        # joining the corners will do, so it needn't follow the mesh's zigzag
+        return ("uvline", sa)
     curved = [s for s in (sa, sb) if _is_curved(s)]
     on_both = lambda: all(_surface_dist(pts, x).max() <= tol for x in (sa, sb) if x is not None)
     if not closed:
@@ -313,14 +320,13 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     labels[free] = len(surfaces) + np.arange(len(free))
     surfaces += [None] * len(free)
 
-    _split_wrapping(points, faces, labels, surfaces)
-
     def demote(regions):
         for r in regions:
             tris = np.nonzero(labels == r)[0]
             labels[tris] = len(surfaces) + np.arange(len(tris))
             surfaces.extend([None] * len(tris))
 
+    _split_wrapping(points, faces, labels, surfaces, range(len(surfaces)))
     for _ in range(max_rounds):
         chains, bad = _build_chains(points, faces, labels, surfaces, he, tol)
         if bad:
@@ -351,15 +357,18 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     return shape
 
 
-def _split_wrapping(points, faces, labels, surfaces):
-    """Split curved regions that wrap all the way round their axis into two halves.
+def _split_wrapping(points, faces, labels, surfaces, regions):
+    """Split those of `regions` that wrap all the way round their axis into two halves.
+    Returns the set of regions that were split (each gains a twin at the end of surfaces).
 
     A face whose boundary loops each circle the axis needs a seam edge joining them, and
     ShapeFix_Face only manages that for plain circular ends (not ellipses, notches...).
     Two half-shells need no seam at all; the final same-domain merge rejoins them into
     one face. Triangles are split by centroid angle, which for the usual column-wise
-    tessellation puts the cut along straight axial mesh edges."""
-    for r in range(len(surfaces)):
+    tessellation puts the cut along axial mesh edges; where it zigzags instead (cones,
+    tori) the twin boundary is built as a straight line in UV, see _uv_edge."""
+    done = set()
+    for r in regions:
         s = surfaces[r]
         if _kind(s) not in ("cylinder", "cone", "torus"):
             continue
@@ -379,13 +388,19 @@ def _split_wrapping(points, faces, labels, surfaces):
         # axial mesh edges — once at the widest gap and once at the gap nearest opposite
         mids = (ang + gaps / 2) % (2 * np.pi)
         cut1 = mids[np.argmax(gaps)]
-        cut2 = mids[np.argmin(np.abs(((mids - cut1) % (2 * np.pi)) - np.pi))]
+        # only gaps between columns qualify: a quad split into two triangles leaves a
+        # small gap *inside* its column, and cutting there would slice a facet diagonally
+        between = gaps >= 0.6 * gaps.max()
+        dist = np.abs(((mids - cut1) % (2 * np.pi)) - np.pi)
+        cut2 = mids[np.argmin(np.where(between, dist, np.inf))]
         theta = np.arctan2(c @ y, c @ x)
         half = (theta - cut1) % (2 * np.pi) < (cut2 - cut1) % (2 * np.pi)
         if half.all() or not half.any():
             continue
         labels[tris[half]] = len(surfaces)
         surfaces.append(s)
+        done.add(r)
+    return done
 
 
 def _build_chains(points, faces, labels, surfaces, he, tol):
@@ -535,6 +550,8 @@ def _chain_edges(geom, path, points, vertex, P):
         es = [_trimmed_edge(circ, path, points, vertex, P)]
     elif kind == "curve":
         es = [_trimmed_edge(geom[1], path, points, vertex, P)]
+    elif kind == "uvline":
+        es = [_uv_edge(geom[1], vertex(path[0]), vertex(path[-1]), P(path[0]), P(path[-1]))]
     else:
         es = [BRepBuilderAPI_MakeEdge(vertex(a), vertex(b)).Edge() for a, b in zip(path, path[1:])]
     return es
@@ -613,7 +630,9 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     blame = set()
     for r, f in made:
         if not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
-            blame.update(x for x in {r} | neighbours[r] if _is_curved(surfaces[x]))
+            # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
+            blame.update({r} if _is_curved(surfaces[r])
+                         else (x for x in neighbours[r] if _is_curved(surfaces[x])))
     if blame:
         raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
 
@@ -688,6 +707,13 @@ def _trimmed_edge(curve, path, points, vertex, P):
             continue
         samples = np.array([c.Value(float(u)).Coord() for u in np.linspace(u0, u1, 9)[1:-1]])
         err = _polyline_dist(samples, poly).max()
+        if closed:
+            # both senses trace the same full circle, so the shape test can't tell them
+            # apart: compare how far along each sense the chain's quarter point sits
+            k = max(1, len(path) // 4)
+            frac = np.cumsum(seg)[k - 1] / seg.sum()
+            uq = GeomAPI_ProjectPointOnCurve(_pnt(poly[k]), c).LowerDistanceParameter()
+            err += abs((uq - u0) % (u1 - u0) / (u1 - u0) - frac) * seg.sum()
         if best is None or err < best[0]:
             best = (err, c, u0, u1)
     if best is None or best[0] > limit:
@@ -704,6 +730,36 @@ def _trimmed_edge(curve, path, points, vertex, P):
     if not mk.IsDone():
         raise RebuildError(f"curve edge failed ({mk.Error()})")
     return mk.Edge()
+
+
+def _uv_edge(surf, v0, v1, p0, p1):
+    """Edge from p0 to p1 that is a straight line in the surface's (u, v) space — exactly
+    on the surface whatever its type, taking the short way across any periodic seam."""
+    S = _geom_surface(surf)
+    sas = ShapeAnalysis_Surface(S)
+    a = sas.ValueOfUV(_pnt(p0), 1e-7)
+    b = sas.ValueOfUV(_pnt(p1), 1e-7)
+    du, dv = b.X() - a.X(), b.Y() - a.Y()
+    if S.IsUPeriodic():
+        T = S.UPeriod()
+        du = (du + T / 2) % T - T / 2
+    if S.IsVPeriodic():
+        T = S.VPeriod()
+        dv = (dv + T / 2) % T - T / 2
+    length = float(np.hypot(du, dv))
+    if length < 1e-12:
+        raise RebuildError("degenerate UV edge")
+    line = Geom2d_Line(gp_Pnt2d(a.X(), a.Y()), gp_Dir2d(du, dv))
+    for v, (u, w) in ((v0, (a.X(), a.Y())), (v1, (a.X() + du, a.Y() + dv))):
+        gap = S.Value(u, w).Distance(BRep_Tool.Pnt_s(v))
+        if gap > BRep_Tool.Tolerance_s(v):
+            BRep_Builder().UpdateVertex(v, gap * 1.01)
+    mk = BRepBuilderAPI_MakeEdge(line, S, v0, v1, 0.0, length)
+    if not mk.IsDone():
+        raise RebuildError(f"UV edge failed ({mk.Error()})")
+    edge = mk.Edge()
+    BRepLib.BuildCurve3d_s(edge, 1e-6)
+    return edge
 
 
 def _seam_dir(pts, origin, axis):

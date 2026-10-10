@@ -1,8 +1,8 @@
 """Run the current converter (stl2step.convert) over the whole corpus and check the result.
 
 Hard requirements: valid solid(s), right number of bodies, <0.5% volume error.
-Cylinder recovery is in progress, so those checks are xfail (non-strict): they turn into
-XPASS as segment.py / rebuild.py land.
+Prismatic rebuild must also recover every truth cylinder and land near the CAD face
+count. Known gap: a full hemisphere dome stays faceted (sphere poles on/inside the patch).
 
 Set STL2STEP_IMPL=module:function or path/to/file.py:function to test another converter.
 """
@@ -56,14 +56,18 @@ def test_volume(result):
 with_cyls = [p for p in STLS if truth_for(p)["cylinders"]]
 
 
-@pytest.mark.xfail(strict=False, reason="cylinder recovery (segment.py / rebuild.py) in progress")
 @pytest.mark.parametrize("result", with_cyls, ids=[p.stem for p in with_cyls], indirect=True)
 def test_cylinders_recovered(result):
     assert result["cyl_hit"] == result["cyl_truth"]
 
 
-@pytest.mark.xfail(strict=False, reason="cylinder recovery (segment.py / rebuild.py) in progress")
-@pytest.mark.parametrize("result", with_cyls, ids=[p.stem for p in with_cyls], indirect=True)
+DOME_FACETED = pytest.mark.xfail(strict=True, reason="hemisphere domes stay faceted")
+
+
+@pytest.mark.parametrize(
+    "result",
+    [pytest.param(p, marks=DOME_FACETED) if p.stem == "countersink_dome_coarse" else p for p in with_cyls],
+    ids=[p.stem for p in with_cyls], indirect=True)
 def test_face_count_near_truth(result):
     # analytic rebuild should give roughly the CAD face count, not one face per facet strip
     assert result["faces"] <= 1.5 * result["truth_faces"]

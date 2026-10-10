@@ -58,11 +58,22 @@ class Sphere:
     outward: bool        # normals point away from center (convex corner blend) vs toward (concave)
 
 
+@dataclass
+class Torus:
+    center: np.ndarray   # (3,)
+    axis: np.ndarray     # (3,) unit
+    major: float         # distance from axis to the tube centre circle
+    minor: float         # tube radius
+    outward: bool        # normals point away from the tube centre circle
+
+
 # curved regions are grown with a tighter tolerance than `tol`: the vertices of a
 # tangent neighbour (flat face next to a fillet, sphere corner after a fillet) leave the
 # surface quadratically, so a tighter band stops growth closer to the true boundary
 GROW_TOL_FRAC = 0.5
 UNIT_TOL_FRAC = 0.05
+UNIT_ANGLE_DEG = 0.02
+MIN_SPAN_DOUBLE_DEG = 40.0
 
 
 # ------------------------------------------------------------------ small helpers
@@ -610,7 +621,7 @@ class _ConeModel(_Model):
         if h.max() * np.tan(self.alpha) > 10 * s.diag or h.max() * np.tan(self.alpha) < 10 * s.tol:
             return False
         span = _span(self.azimuth(X))
-        if span < s.min_span:
+        if span < s.min_span2:
             return False
         nrm = s.un[units]
         nd = _n_dirs(np.arctan2(nrm @ self.e2, nrm @ self.e1), np.radians(0.5))
@@ -691,7 +702,8 @@ class _SphereModel(_Model):
         return True
 
     def quick_ok(self, units):
-        return len(units) >= 3
+        nrm = self.s.un[units]
+        return len(units) >= 4 and np.min(nrm @ nrm.T) <= np.cos(self.s.min_span * 0.8)
 
     def valid(self, units):
         s = self.s
@@ -699,7 +711,7 @@ class _SphereModel(_Model):
             return False
         nrm = s.un[units]
         # angular extent of the patch
-        if nrm.min(0) @ nrm.max(0) > 2 or np.min(nrm @ nrm.T) > np.cos(s.min_span):
+        if nrm.min(0) @ nrm.max(0) > 2 or np.min(nrm @ nrm.T) > np.cos(s.min_span2):
             return False
         # doubly curved: normals must NOT all lie on one circle of the Gauss sphere
         # (a single row of a cylinder / cone / revolved surface fits a sphere exactly)
@@ -710,6 +722,171 @@ class _SphereModel(_Model):
 
     def surface(self):
         return Sphere(self.c.copy(), float(self.R), bool(self.sign > 0))
+
+
+class _TorusModel(_Model):
+    kind = "torus"
+
+    def set(self, c, a, R, r):
+        self.c = np.asarray(c, float)
+        self.a = _unit(a)
+        self.e1, self.e2 = _basis(self.a)
+        self.R, self.r = float(R), float(r)
+
+    def _rh(self, X):
+        v = X - self.c
+        h = v @ self.a
+        rho = np.linalg.norm(v - np.outer(h, self.a), axis=1)
+        return rho, h
+
+    def residual(self, X):
+        rho, h = self._rh(X)
+        return np.hypot(rho - self.R, h) - self.r
+
+    def radial(self, X):
+        """Unit vector from the nearest tube-centre point to X."""
+        v = X - self.c
+        h = v @ self.a
+        p = v - np.outer(h, self.a)
+        rho = np.maximum(np.linalg.norm(p, axis=1), 1e-300)
+        q = p * (self.R / rho)[:, None]
+        d = v - q
+        return d / np.maximum(np.linalg.norm(d, axis=1), 1e-300)[:, None]
+
+    def normal_ok(self, nrm, cen):
+        rad = np.einsum("ij,ij->i", nrm, self.radial(cen)) * self.sign
+        return rad >= self.s.cos_half_step
+
+    def test(self, units):
+        s = self.s
+        ok = self.normal_ok(s.un[units], s.ucen[units])
+        if not ok.any():
+            return ok
+        sub = units[ok]
+        X, lens = self.unit_points(sub)
+        st = _seg_starts(lens)
+        good = np.maximum.reduceat(np.abs(self.residual(X)), st) <= s.grow_tol
+        ok[np.nonzero(ok)[0][~good]] = False
+        return ok
+
+    def fit(self, units, polish=False, **_):
+        s = self.s
+        if not hasattr(self, "r"):
+            # axis: the line meeting all facet normal lines (linear in Pluecker coordinates)
+            n, p = s.un[units], s.ucen[units]
+            if len(units) < 5:
+                return False
+            M = np.column_stack((np.cross(p, n), n))
+            sv, V = np.linalg.svd(M, full_matrices=False)[1:]
+            a, mL = V[-1, :3], V[-1, 3:]
+            na = np.linalg.norm(a)
+            # a sphere patch (all normal lines through one point) leaves the axis undetermined
+            if na < 1e-9 or sv[-2] < 1e-9 * sv[0]:
+                return False
+            a, mL = a / na, mL / na
+            c = np.cross(a, mL)
+            X, _ = self.unit_points(units)
+            v = X - c
+            h = v @ a
+            rho = np.linalg.norm(v - np.outer(h, a), axis=1)
+            cf = _circle_fit(np.column_stack((rho, h)))
+            if cf is None:
+                return False
+            (R, h0), r = cf
+            self.set(c + h0 * a, a, R, r)
+            # facet normals/centroids only approximate the surface; the closed form must
+            # already be close, or this patch is not a torus
+            if np.abs(self.residual(X)).max() > 20 * s.tol or R < 0.1 * r:
+                return False  # not a torus, or sphere-like (axis undetermined)
+            polish = True
+        if polish:
+            X, _ = self.unit_points(units)
+            if len(X) > 3000:  # deterministic subsample keeps refits cheap on big regions
+                X = X[:: len(X) // 3000 + 1]
+            self._polish(X)
+        if not (np.isfinite(self.R) and np.isfinite(self.r) and self.r > 0):
+            return False
+        nrm, w = s.un[units], s.uarea[units]
+        self.sign = 1.0 if (w * np.einsum("ij,ij->i", nrm, self.radial(s.ucen[units]))).sum() >= 0 else -1.0
+        return True
+
+    def _polish(self, X, iters=8):
+        """Levenberg-Marquardt with an analytic Jacobian (axis tilt 2, centre 3, R, r)."""
+        a, c, R, r = self.a, self.c, self.R, self.r
+
+        def resid(a, c, R, r):
+            v = X - c
+            h = v @ a
+            w = v - np.outer(h, a)
+            rho = np.sqrt((w * w).sum(1))
+            D = np.sqrt((rho - R) ** 2 + h * h)
+            return D - r, v, h, w, rho, D
+
+        f, v, h, w, rho, D = resid(a, c, R, r)
+        cost0 = cost = f @ f
+        start = np.abs(f).max()
+        lam = 1e-6
+        for _ in range(iters):
+            e1, e2 = _basis(a)
+            rho_s = np.maximum(rho, 1e-300)
+            D_s = np.maximum(D, 1e-300)
+            what = w / rho_s[:, None]
+            dR = rho - R
+            J = np.empty((len(X), 7))
+            for k, e in enumerate((e1, e2)):          # axis tilt
+                J[:, k] = (dR * (-h * (what @ e)) + h * (v @ e)) / D_s
+            for k, e in enumerate((e1, e2, a)):       # centre shift
+                J[:, 2 + k] = (dR * (-(what @ e)) + h * (-(e @ a))) / D_s
+            J[:, 5] = -dR / D_s
+            J[:, 6] = -1.0
+            JtJ = J.T @ J
+            g = J.T @ f
+            done = True
+            for _ in range(6):
+                try:
+                    step = -np.linalg.solve(JtJ + lam * np.diag(np.diag(JtJ) + 1e-12), g)
+                except np.linalg.LinAlgError:
+                    lam *= 10
+                    continue
+                an = _unit(a + step[0] * e1 + step[1] * e2)
+                cn = c + step[2] * e1 + step[3] * e2 + step[4] * a
+                Rn, rn = R + step[5], r + step[6]
+                out = resid(an, cn, Rn, rn)
+                cn_cost = out[0] @ out[0]
+                if np.isfinite(cn_cost) and cn_cost < cost:
+                    a, c, R, r = an, cn, Rn, rn
+                    f, v, h, w, rho, D = out
+                    cost = cn_cost
+                    lam = max(lam / 10, 1e-9)
+                    done = np.linalg.norm(step) < 1e-12
+                    break
+                lam *= 10
+            else:
+                break
+            if done:
+                break
+        if cost <= cost0 and np.abs(f).max() <= max(start, self.s.tol):
+            self.set(c, a, R, r)
+
+    def quick_ok(self, units):
+        nrm = self.s.un[units]
+        return len(units) >= 6 and self.R >= 0.1 * self.r and np.min(nrm @ nrm.T) <= np.cos(self.s.min_span * 0.8)
+
+    def valid(self, units):
+        s = self.s
+        if not (10 * s.tol < self.r < 10 * s.diag) or not (0.1 * self.r < self.R < 10 * s.diag):
+            return False
+        if len(units) < 6:
+            return False
+        X, _ = self.unit_points(units)
+        rho, h = self._rh(X)
+        minor = _span(np.arctan2(h, rho - self.R))
+        v = X - self.c
+        major = _span(np.arctan2(v @ self.e2, v @ self.e1))
+        return minor >= s.min_span2 and major >= s.min_span2
+
+    def surface(self):
+        return Torus(self.c.copy(), _canon(self.a.copy()), float(self.R), float(self.r), bool(self.sign > 0))
 
 
 # ------------------------------------------------------------------ the segmenter
@@ -726,6 +903,9 @@ class _Seg:
         self.sin_tilt_cyl = np.sin(np.radians(min(max_tilt_deg, 1.5)))
         self.sin_tilt_cone = np.sin(np.radians(min(max_tilt_deg, 3.0)))
         self.min_span = np.radians(min_span_deg)
+        # cones, spheres and tori need more coverage: small patches of helical / freeform
+        # surfaces (threads, organic shapes) fit them within tolerance by accident
+        self.min_span2 = np.radians(max(min_span_deg, MIN_SPAN_DOUBLE_DEG))
         self.min_cone, self.max_cone = np.radians(2.0), np.radians(88.0)
         P = self.points[self.faces]
         self.P = P
@@ -745,7 +925,7 @@ class _Seg:
         # sliver of a neighbouring curved surface never gets welded onto a facet strip
         noise = 5e-7 * float(np.abs(self.points).max()) if len(self.points) else 0.0
         unit = _planar_units(self.P, self.tn, self.tarea, self.nbr, max(UNIT_TOL_FRAC * self.tol, noise),
-                             self.angle_deg)
+                             min(self.angle_deg, UNIT_ANGLE_DEG))
         U = int(unit.max()) + 1 if F else 0
         self.unit, self.U = unit, U
         a = self.tarea
@@ -873,7 +1053,7 @@ class _Seg:
                 stalled_at = len(region)
                 reg = np.array(region)
                 saved = model.__dict__.copy()
-                if not model.fit(reg, polish=True):
+                if not model.fit(reg, polish=model.kind != "sphere"):
                     model.__dict__.update(saved)
                 grown_at_fit = len(region)
                 pos, _ = _ranges(s.uadj_ptr, reg)
@@ -931,6 +1111,7 @@ class _Seg:
         self.models.append(model)
 
     def cylinders(self):
+        self.noseed = np.zeros(self.U, bool)   # per pass
         u, v, w = self.seed_triples()
         nu, nv, nw = self.un[u], self.un[v], self.un[w]
         ax1 = np.cross(nu, nv)
@@ -967,6 +1148,11 @@ class _Seg:
                 region = self.try_region(m, seed, list(init), {"axis": axis, "polish": True})
                 if region is not None:
                     self.accept(m, region)
+                    break
+                # a sizeable patch that fits one cylinder but is not a valid cylinder
+                # region (too narrow, freeform): don't restart from inside it
+                if self.last_grown is not None and len(self.last_grown) >= 6:
+                    noseed[self.last_grown] = True
                     break
 
     def _circle_triples(self, u, v, w, ax):
@@ -1052,34 +1238,13 @@ class _Seg:
         return ok
 
     def spheres(self):
+        self.noseed = np.zeros(self.U, bool)   # per pass
         u, v, w = self.seed_triples()
         keep = (self.label[u] < 0) & (self.label[v] < 0) & (self.label[w] < 0)
         u, v, w = u[keep], v[keep], w[keep]
         if len(u) == 0:
             return
-        # centre: least-squares meeting point of the three facet normal lines
-        A = np.zeros((len(u), 3, 3))
-        b = np.zeros((len(u), 3))
-        for x in (u, v, w):
-            n = self.un[x]
-            Pm = np.eye(3)[None] - n[:, :, None] * n[:, None, :]
-            A += Pm
-            b += np.einsum("ijk,ik->ij", Pm, self.ucen[x])
-        det = np.linalg.det(A)
-        ok = np.abs(det) > 1e-9
-        A[~ok] = np.eye(3)
-        c = np.linalg.solve(A, b[:, :, None])[:, :, 0]
-        R = np.zeros(len(u))
-        mx = np.zeros(len(u))
-        mn = np.full(len(u), np.inf)
-        for x in (u, v, w):
-            pos, lens = _ranges(self.vptr, x)
-            own = np.repeat(np.arange(len(x)), lens)
-            dist = np.linalg.norm(self.points[self.vidx[pos]] - c[own], axis=1)
-            np.maximum.at(mx, own, dist)
-            np.minimum.at(mn, own, dist)
-        # facet planes are chords, so allow the sagitta; the real check is the fit
-        ok &= (mx - mn <= 0.1 * mx + 2 * self.tol) & (mx > 10 * self.tol) & (mx < 10 * self.diag)
+        ok = self._sphere_triples(u, v, w)
         u, v, w = u[ok], v[ok], w[ok]
         sel = self._first_per_unit(u, 2)
         u, v, w = u[sel], v[sel], w[sel]
@@ -1087,21 +1252,78 @@ class _Seg:
         for i in order.tolist():
             if self.label[u[i]] >= 0 or self.label[v[i]] >= 0 or self.label[w[i]] >= 0:
                 continue
-            init = [int(u[i]), int(v[i]), int(w[i])]
-            # widen the initial support by the 1-ring so the algebraic fit is well posed
-            ring = np.unique(self.uadj_idx[_ranges(self.uadj_ptr, np.array(init))[0]])
-            ring = ring[self.label[ring] < 0]
             if self.noseed[u[i]]:
                 continue
             m = _SphereModel(self)
             self.last_grown = None
-            region = self.try_region(m, int(u[i]), np.union1d(init, ring), {"polish": True})
+            region = self.try_region(m, int(u[i]), [int(u[i]), int(v[i]), int(w[i])], {})
             if region is not None:
                 self.accept(m, region)
             elif self.last_grown is not None:
                 self.noseed[self.last_grown] = True
 
+    def tori(self):
+        self.noseed = np.zeros(self.U, bool)   # per pass
+        u, v, w = self.seed_triples()
+        keep = (self.label[u] < 0) & (self.label[v] < 0) & (self.label[w] < 0)
+        u = np.unique(u[keep])
+        order = np.lexsort((u, -self.uarea[u]))
+        for seed in u[order].tolist():
+            if self.label[seed] >= 0 or self.noseed[seed]:
+                continue
+            # local patch: seed + 2-ring of free units
+            patch = np.array([seed])
+            for _ in range(2):
+                ring = self.uadj_idx[_ranges(self.uadj_ptr, patch)[0]]
+                patch = np.union1d(patch, ring[self.label[ring] < 0])
+            m = _TorusModel(self)
+            self.last_grown = None
+            region = None
+            if len(patch) >= 6:
+                region = self.try_region(m, seed, patch, {})
+            if region is not None:
+                self.accept(m, region)
+            else:
+                self.noseed[patch] = True
+                if self.last_grown is not None:
+                    self.noseed[self.last_grown] = True
+
+    def _sphere_triples(self, u, v, w):
+        """Vectorised algebraic sphere fit through the vertices of each triple; True where
+        all vertices are within 2*tol and the radius is sane."""
+        n = len(u)
+        Xs, owners = [], []
+        for x in (u, v, w):
+            pos, lens = _ranges(self.vptr, x)
+            Xs.append(self.points[self.vidx[pos]])
+            owners.append(np.repeat(np.arange(n), lens))
+        X, own = np.concatenate(Xs), np.concatenate(owners)
+        cnt = np.bincount(own, minlength=n).astype(float)
+        mean = np.stack([np.bincount(own, X[:, k], n) for k in range(3)], 1) / cnt[:, None]
+        Q = X - mean[own]
+        z = (Q * Q).sum(1)
+        cols = (Q[:, 0], Q[:, 1], Q[:, 2], np.ones(len(Q)))
+        A = np.empty((n, 4, 4))
+        b = np.empty((n, 4))
+        for i in range(4):
+            b[:, i] = -np.bincount(own, cols[i] * z, n)
+            for j in range(i, 4):
+                A[:, i, j] = A[:, j, i] = np.bincount(own, cols[i] * cols[j], n)
+        scale = np.abs(A).max(axis=(1, 2)) + 1e-300
+        ok = np.abs(np.linalg.det(A / scale[:, None, None])) > 1e-14
+        A[~ok] = np.eye(4)
+        sol = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+        c = -sol[:, :3] / 2
+        r2 = (c * c).sum(1) - sol[:, 3]
+        ok &= r2 > 0
+        r = np.sqrt(np.maximum(r2, 0))
+        res = np.abs(np.linalg.norm(Q - c[own], axis=1) - r[own])
+        mx = np.zeros(n)
+        np.maximum.at(mx, own, res)
+        return ok & (mx <= 2 * self.tol) & (r > 10 * self.tol) & (r < 10 * self.diag)
+
     def cones(self):
+        self.noseed = np.zeros(self.U, bool)   # per pass
         u, v, w = self.seed_triples()
         keep = (self.label[u] < 0) & (self.label[v] < 0) & (self.label[w] < 0)
         u, v, w = u[keep], v[keep], w[keep]
@@ -1149,7 +1371,7 @@ class _Seg:
             if not self._same(self.surfaces[ri], self.surfaces[rj]):
                 continue
             units = np.nonzero((lab == ri) | (lab == rj) | np.isin(lab, [k for k in range(n) if find(k) in (ri, rj)]))[0]
-            mdl = {"cyl": _CylModel, "cone": _ConeModel, "sphere": _SphereModel}[self.kinds[ri]](self)
+            mdl = {"cyl": _CylModel, "cone": _ConeModel, "sphere": _SphereModel, "torus": _TorusModel}[self.kinds[ri]](self)
             if not mdl.fit(units, polish=True):
                 continue
             X, _ = mdl.unit_points(units)
@@ -1177,6 +1399,9 @@ class _Seg:
                 return False
             d = B.origin - A.origin
             return np.linalg.norm(d - (d @ A.axis) * A.axis) <= self.tol
+        if isinstance(A, Torus):
+            return (abs(A.major - B.major) <= self.tol and abs(A.minor - B.minor) <= self.tol
+                    and abs(A.axis @ B.axis) >= np.cos(ang) and np.linalg.norm(A.center - B.center) <= self.tol)
         if isinstance(A, Sphere):
             return abs(A.radius - B.radius) <= self.tol and np.linalg.norm(A.center - B.center) <= self.tol
         if abs(A.half_angle - B.half_angle) > np.radians(0.5) or A.axis @ B.axis < np.cos(ang):
@@ -1213,12 +1438,112 @@ class _Seg:
         vec = np.linalg.eigh(C)[1][:, :, 0]
         mn = np.stack([np.bincount(inv, self.tn[tris, k] * self.tarea[tris], G) for k in range(3)], 1)
         vec[np.einsum("ij,ij->i", vec, mn) < 0] *= -1
+        mn /= np.linalg.norm(mn, axis=1)[:, None]
+        # least squares minimises the RMS, the contract is the MAX distance: try both the
+        # LS normal and the area-weighted mean normal, centre each on its residual range
+        # and keep whichever has the smaller worst-case distance
+        best = None
+        for nv in (vec, mn):
+            dd = np.einsum("ij,ij->i", X - cen[own], nv[own])
+            lo = np.full(G, np.inf)
+            hi = np.full(G, -np.inf)
+            np.minimum.at(lo, own, dd)
+            np.maximum.at(hi, own, dd)
+            cand = (nv, cen + nv * ((lo + hi) / 2)[:, None], (hi - lo) / 2)
+            if best is None:
+                best = cand
+            else:
+                pick = cand[2] < best[2]
+                best = tuple(np.where(pick[:, None] if b.ndim == 2 else pick, c, b) for b, c in zip(best, cand))
+        vec, cen = best[0], best[1]
         base = len(self.surfaces)
         labels[tris] = base + inv
         for i in range(G):
             self.surfaces.append(Plane(cen[i].copy(), vec[i].copy()))
             self.kinds.append("plane")
         return labels
+
+
+def _surf_residual(sf, X):
+    """Signed distance-like residual of points X to a result surface."""
+    if isinstance(sf, Plane):
+        return (X - sf.origin) @ sf.normal
+    if isinstance(sf, Cylinder):
+        v = X - sf.origin
+        return np.linalg.norm(v - np.outer(v @ sf.axis, sf.axis), axis=1) - sf.radius
+    if isinstance(sf, Cone):
+        v = X - sf.origin
+        h = v @ sf.axis
+        rho = np.linalg.norm(v - np.outer(h, sf.axis), axis=1)
+        return np.where(h >= 0, rho * np.cos(sf.half_angle) - h * np.sin(sf.half_angle), np.inf)
+    if isinstance(sf, Sphere):
+        return np.linalg.norm(X - sf.center, axis=1) - sf.radius
+    v = X - sf.center
+    h = v @ sf.axis
+    rho = np.linalg.norm(v - np.outer(h, sf.axis), axis=1)
+    return np.hypot(rho - sf.major, h) - sf.minor
+
+
+def _refine_boundaries(P, nbr, labels, surfaces, rounds=3):
+    """Hand boundary triangles to the neighbouring region whose surface they fit much
+    better. Along tangent joints (fillet -> flat face, cylinder -> corner sphere) both
+    surfaces pass the tolerance test, and growth order decides who gets the first row;
+    the triangle's far vertex says which surface it really belongs to. A move is undone if
+    it would disconnect the region it leaves."""
+    labels = labels.copy()
+    F = len(labels)
+    for _ in range(rounds):
+        t = np.repeat(np.arange(F), 3)
+        o = nbr.ravel()
+        m = (o >= 0) & (labels[t] >= 0)
+        t, o = t[m], o[m]
+        m = (labels[o] >= 0) & (labels[o] != labels[t])
+        t, o = t[m], o[m]
+        if len(t) == 0:
+            break
+        cand = {}
+        for ti, oi in zip(t.tolist(), o.tolist()):
+            cand.setdefault(ti, set()).add(int(labels[oi]))
+        moves = {}
+        for ti, others in sorted(cand.items()):
+            X = P[ti]
+            own = np.abs(_surf_residual(surfaces[labels[ti]], X)).max()
+            best, bres = None, own
+            for L in sorted(others):
+                r = np.abs(_surf_residual(surfaces[L], X)).max()
+                if r < 0.25 * bres:
+                    best, bres = L, r
+            if best is not None and own > 1e-12:
+                moves[ti] = best
+        if not moves:
+            break
+        old = labels.copy()
+        for ti, L in moves.items():
+            labels[ti] = L
+        # connectivity: any region that lost triangles must stay one piece, and every
+        # moved triangle must touch its new region
+        lost = {int(old[ti]) for ti in moves}
+        bad = set()
+        for L in lost:
+            tris = np.nonzero(labels == L)[0]
+            if len(tris) == 0:
+                bad.add(L)
+                continue
+            idx = -np.ones(F, np.int64)
+            idx[tris] = np.arange(len(tris))
+            nb = nbr[tris]
+            ok = (nb >= 0) & (labels[np.maximum(nb, 0)] == L)
+            r = np.repeat(np.arange(len(tris)), 3)[ok.ravel()]
+            c = idx[nb[ok]]
+            g = coo_matrix((np.ones(len(r)), (r, c)), shape=(len(tris), len(tris)))
+            if connected_components(g, directed=False)[0] > 1:
+                bad.add(L)
+        for ti in moves:
+            if int(old[ti]) in bad:
+                labels[ti] = old[ti]
+        if np.array_equal(labels, old):
+            break
+    return labels
 
 
 def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float = 0.5,
@@ -1245,7 +1570,9 @@ def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float 
     s.cylinders()
     if cones:
         s.cones()
+    s.tori()
     s.spheres()
     s.merge()
     labels = s.planes()
+    labels = _refine_boundaries(s.P, s.nbr, labels, s.surfaces)
     return labels, s.surfaces
