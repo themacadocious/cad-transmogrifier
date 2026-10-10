@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBuilderAPI import (
-    BRepBuilderAPI_Copy,
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeVertex,
@@ -232,8 +231,8 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
     shape = None
     if merge and prismatic:
         shape = prismatic_rebuild(points, faces, fit_tol or max(diag * 2e-5, 1e-3), angle, tol, progress)
-    if shape is not None:
-        return _finish(shape, True, src, out, t0, progress)
+    if shape is not None:  # rebuild() already proved it a valid closed solid
+        return _finish(shape, True, src, out, t0, progress, valid=True)
 
     shell, failed = build_shell(points, faces)
     if failed:
@@ -261,24 +260,6 @@ def prismatic_rebuild(points, faces, fit_tol, angle, tol, progress):
     except Exception as e:  # never worse than faceted: any failure falls back
         progress(f"  prismatic rebuild not possible ({type(e).__name__}: {e}); using faceted conversion")
         return None
-    # coplanar facets the segmenter left apart, split cylinder halves, etc. The rebuilt
-    # solid is already valid, so if the merge throws or breaks it, keep it unmerged
-    # (edge unification is what usually throws, so retry without it)
-    for unify_edges in (True, False):
-        try:
-            # on a copy: a merge that throws can leave its input modified in place
-            merged = merge_coplanar(BRepBuilderAPI_Copy(shape).Shape(), angle, tol * 10, unify_edges)
-        except Exception as e:
-            progress(f"  note: face merge failed ({type(e).__name__}: {e})")
-            continue
-        if BRepCheck_Analyzer(merged).IsValid() \
-                and rebuild.count_solid_faces(merged) == rebuild.count_all_faces(merged):
-            shape = merged
-            break
-        progress("  note: face merge produced an invalid result")
-    if not BRepCheck_Analyzer(shape).IsValid():
-        progress("  prismatic rebuild came out invalid; using faceted conversion")
-        return None
     kinds = face_types(shape)
     progress("  prismatic: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + " faces")
     return shape
@@ -295,9 +276,10 @@ def face_types(shape):
     return kinds
 
 
-def _finish(shape, is_solid, src, out, t0, progress):
+def _finish(shape, is_solid, src, out, t0, progress, valid=None):
     if is_solid:
-        valid = BRepCheck_Analyzer(shape).IsValid()
+        if valid is None:
+            valid = BRepCheck_Analyzer(shape).IsValid()
         progress(f"  solid volume {volume(shape):.3f} mm^3, "
                  + ("valid" if valid else "WARNING: BRepCheck reports problems"))
 

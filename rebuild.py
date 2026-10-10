@@ -23,7 +23,9 @@ from collections import defaultdict
 
 import numpy as np
 from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_Copy,
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeVertex,
@@ -43,9 +45,12 @@ from OCP.Geom import (
     Geom_TrimmedCurve,
 )
 from OCP.Geom2d import Geom2d_Line
+from OCP.GeomAbs import GeomAbs_Plane
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
 from OCP.ShapeAnalysis import ShapeAnalysis_Surface
 from OCP.ShapeBuild import ShapeBuild_ReShape
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+from OCP.collections import Map_TopoDS_Shape_TopTools_ShapeMapHasher as ShapeMap
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
@@ -326,7 +331,7 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
             labels[tris] = len(surfaces) + np.arange(len(tris))
             surfaces.extend([None] * len(tris))
 
-    _split_wrapping(points, faces, labels, surfaces, range(len(surfaces)))
+    n_split = len(_split_wrapping(points, faces, labels, surfaces, range(len(surfaces))))
     for _ in range(max_rounds):
         chains, bad = _build_chains(points, faces, labels, surfaces, he, tol)
         if bad:
@@ -354,6 +359,49 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     want = mesh_volume(points, faces)
     if want <= 0 or abs(props.Mass() - want) / want > 0.02:
         raise RebuildError(f"volume mismatch: rebuilt {props.Mass():.3f} vs mesh {want:.3f}")
+    if n_split or count_all_faces(shape) <= REJOIN_FULL_LIMIT:
+        shape = _rejoin(shape, tol)
+    return shape
+
+
+REJOIN_FULL_LIMIT = 5000  # faces; above this the final merge leaves planes alone
+
+
+def _rejoin(shape, tol, angle_deg=0.5, fix_limit=REJOIN_FULL_LIMIT):
+    """Merge split curved halves back into single faces (and, on small shapes, any
+    near-coplanar facets the segmenter left apart), best effort: the input is a
+    valid solid, so any merge that throws or comes out invalid is simply dropped.
+    On big shapes planes are kept out of the merge (the segmenter already grouped them,
+    give or take a stray coplanar facet) and no ShapeFix is attempted, which together
+    cost seconds per 10k faces; small shapes get the full merge + ShapeFix rescue."""
+    small = count_all_faces(shape) <= fix_limit
+    keep = ShapeMap()
+    exp = TopExp_Explorer(shape if not small else TopoDS_Compound(), TopAbs_FACE)
+    while exp.More():
+        f = exp.Current()
+        if BRepAdaptor_Surface(TopoDS.Face(f)).GetType() == GeomAbs_Plane:
+            keep.Add(f)
+        exp.Next()
+    for unify_edges in (True, False):
+        try:
+            # on a copy: a merge that throws can leave its input modified in place
+            u = ShapeUpgrade_UnifySameDomain(BRepBuilderAPI_Copy(shape).Shape(), unify_edges, True, False)
+            u.SetLinearTolerance(tol)
+            u.SetAngularTolerance(np.radians(angle_deg))
+            u.AllowInternalEdges(False)
+            u.KeepShapes(keep)
+            u.Build()
+            merged = u.Shape()
+        except Exception:
+            continue
+        candidates = [merged]
+        if small:
+            fix = ShapeFix_Shape(merged)
+            fix.Perform()
+            candidates.append(fix.Shape())
+        for m in candidates:
+            if BRepCheck_Analyzer(m).IsValid() and count_solid_faces(m) == count_all_faces(m):
+                return m
     return shape
 
 
@@ -370,6 +418,10 @@ def _split_wrapping(points, faces, labels, surfaces, regions):
     done = set()
     for r in regions:
         s = surfaces[r]
+        if _kind(s) == "sphere":
+            if _split_sphere(points, faces, labels, surfaces, r):
+                done.add(r)
+            continue
         if _kind(s) not in ("cylinder", "cone", "torus"):
             continue
         tris = np.nonzero(labels == r)[0]
@@ -401,6 +453,36 @@ def _split_wrapping(points, faces, labels, surfaces, regions):
         surfaces.append(s)
         done.add(r)
     return done
+
+
+def _split_sphere(points, faces, labels, surfaces, r, max_angle=np.radians(70), depth=3):
+    """Bisect a large sphere patch until every piece stays within max_angle of its own
+    centre direction. A sphere frame then always has both poles (90 degrees from the piece
+    centre, see _make_face) outside the piece; a hemisphere dome otherwise has a pole on or
+    inside it, which needs degenerate edges. Pieces meet along great-circle arcs."""
+    s = surfaces[r]
+    tris = np.nonzero(labels == r)[0]
+    if depth == 0 or len(tris) < 8:
+        return False
+    d = points[faces[tris]].reshape(-1, 3) - s.center
+    d /= np.linalg.norm(d, axis=1)[:, None]
+    m = d.mean(axis=0)
+    m /= np.linalg.norm(m)
+    if np.arccos(np.clip(d @ m, -1, 1)).max() <= max_angle:
+        return False
+    # cut with the plane through the centre and m, across the widest spread
+    c = points[faces[tris]].mean(axis=1) - s.center
+    perp = c - np.outer(c @ m, m)
+    _, _, vt = np.linalg.svd(perp, full_matrices=False)
+    side = perp @ vt[0] > 0
+    if side.all() or not side.any():
+        return False
+    twin = len(surfaces)
+    labels[tris[side]] = twin
+    surfaces.append(s)
+    _split_sphere(points, faces, labels, surfaces, r, max_angle, depth - 1)
+    _split_sphere(points, faces, labels, surfaces, twin, max_angle, depth - 1)
+    return True
 
 
 def _build_chains(points, faces, labels, surfaces, he, tol):
@@ -550,6 +632,8 @@ def _chain_edges(geom, path, points, vertex, P):
         es = [_trimmed_edge(circ, path, points, vertex, P)]
     elif kind == "curve":
         es = [_trimmed_edge(geom[1], path, points, vertex, P)]
+    elif kind == "uvline" and _kind(geom[1]) == "sphere":
+        es = [_great_arc(geom[1], vertex(path[0]), vertex(path[-1]), P(path[0]), P(path[-1]))]
     elif kind == "uvline":
         es = [_uv_edge(geom[1], vertex(path[0]), vertex(path[-1]), P(path[0]), P(path[-1]))]
     else:
@@ -628,8 +712,12 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
         neighbours[ra].add(rb)
         neighbours[rb].add(ra)
     blame = set()
+    curvedish = {r for r, _ in made if _is_curved(surfaces[r])}
+    curvedish |= {x for r in curvedish for x in neighbours[r]}
     for r, f in made:
-        if not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
+        # only curved faces and their neighbours can be spoiled by this construction;
+        # anything else is caught by the whole-solid check in rebuild()
+        if r in curvedish and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
             # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
             blame.update({r} if _is_curved(surfaces[r])
                          else (x for x in neighbours[r] if _is_curved(surfaces[x])))
@@ -729,6 +817,25 @@ def _trimmed_edge(curve, path, points, vertex, P):
     mk = BRepBuilderAPI_MakeEdge(c, v0, v1, float(u0), float(u1))
     if not mk.IsDone():
         raise RebuildError(f"curve edge failed ({mk.Error()})")
+    return mk.Edge()
+
+
+def _great_arc(sph, v0, v1, p0, p1):
+    """Shorter great-circle arc from p0 to p1: exactly on the sphere, and unlike a UV line
+    it doesn't care where the parametrisation's poles are."""
+    a, b = p0 - sph.center, p1 - sph.center
+    n = np.cross(a, b)
+    if np.linalg.norm(n) < 1e-12:
+        raise RebuildError("degenerate great arc")
+    ang = float(np.arctan2(np.linalg.norm(n), a @ b))
+    circ = Geom_Circle(gp_Circ(gp_Ax2(_pnt(sph.center), _dir(n), _dir(a)), float(sph.radius)))
+    for v, u in ((v0, 0.0), (v1, ang)):
+        gap = circ.Value(u).Distance(BRep_Tool.Pnt_s(v))
+        if gap > BRep_Tool.Tolerance_s(v):
+            BRep_Builder().UpdateVertex(v, gap * 1.01)
+    mk = BRepBuilderAPI_MakeEdge(circ, v0, v1, 0.0, ang)
+    if not mk.IsDone():
+        raise RebuildError(f"great arc failed ({mk.Error()})")
     return mk.Edge()
 
 

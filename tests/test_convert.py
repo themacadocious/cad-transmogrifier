@@ -2,7 +2,7 @@
 
 Hard requirements: valid solid(s), right number of bodies, <0.5% volume error.
 Prismatic rebuild must also recover every truth cylinder and land near the CAD face
-count. Known gap: a full hemisphere dome stays faceted (sphere poles on/inside the patch).
+count (large sphere patches come back as a few pieces, hence "near").
 
 Set STL2STEP_IMPL=module:function or path/to/file.py:function to test another converter.
 """
@@ -61,13 +61,7 @@ def test_cylinders_recovered(result):
     assert result["cyl_hit"] == result["cyl_truth"]
 
 
-DOME_FACETED = pytest.mark.xfail(strict=True, reason="hemisphere domes stay faceted")
-
-
-@pytest.mark.parametrize(
-    "result",
-    [pytest.param(p, marks=DOME_FACETED) if p.stem == "countersink_dome_coarse" else p for p in with_cyls],
-    ids=[p.stem for p in with_cyls], indirect=True)
+@pytest.mark.parametrize("result", with_cyls, ids=[p.stem for p in with_cyls], indirect=True)
 def test_face_count_near_truth(result):
     # analytic rebuild should give roughly the CAD face count, not one face per facet strip
     assert result["faces"] <= 1.5 * result["truth_faces"]
