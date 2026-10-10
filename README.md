@@ -53,3 +53,18 @@ with per-triangle labels) — see `tests/README.md`.
   `ShapeFix_Face` only adds one for plain circular ends. rebuild.py splits such regions
   into half-shells instead and lets `ShapeUpgrade_UnifySameDomain` rejoin them.
 - `GeomAPI_IntSS` returns trimmed curves; trim/reverse their `BasisCurve()` instead.
+
+## Known limitations
+- **Full hemisphere domes** stay faceted: a sphere patch that large always has a pole
+  on or inside it, which needs degenerate-edge handling rebuild.py doesn't do yet.
+  Corner blends (1/8 spheres) are fine.
+- **Speed**: segmentation is ~1.5 ms per 10 triangles on freeform/threaded meshes
+  (30k triangles ≈ 5 s segment + ~25 s rebuild/merge/STEP). Fine meshes of 100k+
+  triangles get slow.
+- **Very finely tessellated tori** (angular step < ~2°) can be misread as stacks of thin
+  cylinders.
+- **Threads and organic shapes** stay facets, and occasionally produce a small
+  accidental sphere/cone that happens to fit within tolerance.
+- **Ambiguous geometry**: an octagonal prism can come out as a cylinder; a shallow flat
+  on a shaft (< ~46°) can be absorbed into the cylinder.
+- Non-manifold / non-watertight meshes skip the rebuild and export as an open surface.
