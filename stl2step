@@ -1,0 +1,4 @@
+#!/bin/sh
+# launcher: runs stl2step.py with the project venv (no args = GUI)
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/.venv/bin/python" "$here/stl2step.py" "$@"
