@@ -362,7 +362,11 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, props)
     want = mesh_volume(points, faces)
-    if want <= 0 or abs(props.Mass() - want) / want > 0.02:
+    # flat facets cut inside convex curves (and outside concave ones), so a correct
+    # rebuild of a coarse mesh legitimately differs from it: allow the volume between
+    # each curved region's facets and its true surface, on top of 2%
+    allowance = 0.02 * abs(want) + 1.5 * _chord_volume(points, faces, labels, surfaces)
+    if want <= 0 or abs(props.Mass() - want) > allowance:
         raise RebuildError(f"volume mismatch: rebuilt {props.Mass():.3f} vs mesh {want:.3f}")
     if n_split or count_all_faces(shape) <= REJOIN_FULL_LIMIT:
         shape = _rejoin(shape, tol)
@@ -408,6 +412,20 @@ def _rejoin(shape, tol, angle_deg=0.5, fix_limit=REJOIN_FULL_LIMIT):
             if BRepCheck_Analyzer(m).IsValid() and count_solid_faces(m) == count_all_faces(m):
                 return m
     return shape
+
+
+def _chord_volume(points, faces, labels, surfaces):
+    """Rough volume between the facets of curved regions and their true surfaces:
+    facet area x distance of the facet centre from the surface."""
+    total = 0.0
+    for r, tris in _region_index(labels).items():
+        s = surfaces[r]
+        if not _is_curved(s):
+            continue
+        p = points[faces[tris]]
+        area = np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1) / 2
+        total += float((area * _surface_dist(p.mean(axis=1), s)).sum())
+    return total
 
 
 def _split_wrapping(points, faces, labels, surfaces, regions):

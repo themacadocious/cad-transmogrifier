@@ -242,7 +242,7 @@ def write(shape, out, name):
 
 
 def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
-            prismatic=True, fit_tol=None, repair_mesh=True):
+            prismatic=True, fit_tol=None, repair_mesh=True, min_cyl_facets=None):
     src = Path(src)
     out = Path(out) if out else src.with_suffix(".step")
     t0 = time.time()
@@ -262,7 +262,8 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
 
     shape = None
     if merge and prismatic:
-        shape = prismatic_rebuild(points, faces, fit_tol or max(diag * 2e-5, 1e-3), angle, tol, progress)
+        shape = prismatic_rebuild(points, faces, fit_tol or max(diag * 2e-5, 1e-3), angle, tol, progress,
+                                  min_cyl_facets)
     if shape is not None:  # rebuild() already proved it a valid closed solid
         fused = fuse_overlapping(shape, angle, tol * 10, progress)
         return _finish(fused, True, src, out, t0, progress, valid=True if fused is shape else None)
@@ -284,13 +285,14 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
     return _finish(shape, is_solid, src, out, t0, progress)
 
 
-def prismatic_rebuild(points, faces, fit_tol, angle, tol, progress):
+def prismatic_rebuild(points, faces, fit_tol, angle, tol, progress, min_cyl_facets=None):
     """Recognise planes/cylinders and rebuild true analytic faces. None if it can't."""
     try:
         import rebuild
         import segment
 
-        labels, surfaces = segment.segment(points, faces, fit_tol, angle)
+        extra = {} if min_cyl_facets is None else {"min_cyl_facets": min_cyl_facets}
+        labels, surfaces = segment.segment(points, faces, fit_tol, angle, **extra)
         shape = rebuild.rebuild(points, faces, labels, surfaces, fit_tol)
     except Exception as e:  # never worse than faceted: any failure falls back
         progress(f"  prismatic rebuild not possible ({type(e).__name__}: {e}); using faceted conversion")
@@ -485,6 +487,9 @@ def main():
     ap.add_argument("--fit-tol", type=float,
                     help="max deviation in mm for a vertex to count as on a plane/cylinder (default: auto)")
     ap.add_argument("--weld", type=float, help="vertex weld tolerance in mm (default: auto)")
+    ap.add_argument("--min-cyl-facets", type=int, metavar="N",
+                    help="full-turn shapes with fewer than N facets stay flat-sided prisms "
+                         "instead of becoming cylinders (default: decided from the mesh)")
     ap.add_argument("--no-repair", action="store_true",
                     help="don't fix non-manifold edges, cracks, holes or winding before converting")
     args = ap.parse_args()
@@ -497,7 +502,8 @@ def main():
     for src in args.inputs:
         try:
             convert(src, args.output, not args.no_merge, args.angle, args.weld,
-                    prismatic=not args.faceted, fit_tol=args.fit_tol, repair_mesh=not args.no_repair)
+                    prismatic=not args.faceted, fit_tol=args.fit_tol, repair_mesh=not args.no_repair,
+                    min_cyl_facets=args.min_cyl_facets)
         except Exception as e:
             log(f"{src}: ERROR: {e}")
             rc = 1

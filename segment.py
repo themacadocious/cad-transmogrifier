@@ -86,6 +86,14 @@ UNIT_ANGLE_DEG = 0.02
 MIN_SPAN_DOUBLE_DEG = 40.0
 # a sphere seed triple needs this many more facets around it on the same sphere
 MIN_SPHERE_SUPPORT = 3
+# Polygonal prism vs coarse cylinder (reject_polygon_prisms). From a survey of 233
+# full-turn cylinders in 65 real-world STLs (Fusion / Onshape / slicer exports): the
+# coarsest had 20 facets per turn (18 degree steps) and the largest sagitta 0.05 mm;
+# within a part, curved faces' sagittas agree to ~2-3x.
+POLY_MAX_FACETS = 18       # only full turns this coarse (facets per turn) are ever in doubt
+POLY_SAG_RATIO = 4.0       # x the part's typical sagitta
+POLY_ABS_SAG = 0.25        # mm, no reference curvature: 5x the largest seen in the survey
+POLY_ABS_FACETS = 12       # ... and at most this many facets per turn (none seen below 20)
 
 
 # ------------------------------------------------------------------ small helpers
@@ -1909,30 +1917,61 @@ class _Seg:
             self.kinds = [self.kinds[r] for r in roots]
             self.models = [self.models[r] for r in roots]
 
-    def reject_polygon_prisms(self):
-        """An octagonal (or coarser) prism fits a cylinder exactly. Tessellators give small
-        radii no more facets per turn than big ones, so a full-turn 'cylinder' with
-        >= 30 degree facets is taken for a polygonal prism when the same mesh has a
-        cylinder or cone of smaller or similar radius tessellated at least twice as
-        finely. (A mesh whose only curved surface is coarse stays ambiguous.)"""
-        info = []
-        for l, (kind, mdl) in enumerate(zip(self.kinds, self.models)):
-            if kind not in ("cyl", "cone"):
-                continue
-            units = np.nonzero(self.label == l)[0]
-            X, lens = mdl.unit_points(units)
+    def region_sagitta(self, l):
+        """(sagitta, facet step rad, closes all round?) of curved region l. The sagitta
+        is the chordal deviation the exporter allowed: r (1 - cos(step / 2)) for the
+        typical facet step around a cylinder / cone axis; for spheres and tori, 1.5x the
+        typical deviation at the facet centroids (a triangle's centroid sits a bit inside
+        its maximum). Step and closure are only defined for cylinders and cones."""
+        kind, mdl = self.kinds[l], self.models[l]
+        units = np.nonzero(self.label == l)[0]
+        X, lens = mdl.unit_points(units)
+        if kind in ("cyl", "cone"):
             step = float(np.median(mdl._widths(units, X, lens)))
-            span = _span(mdl.azimuth(X))
             v = X - mdl.c
             h = v @ mdl.a
             rad = float(np.linalg.norm(v - np.outer(h, mdl.a), axis=1).mean())
-            info.append((l, kind, step, span, rad))
+            closed = _span(mdl.azimuth(X)) >= 2 * np.pi - 1.5 * step
+            return rad * (1 - np.cos(step / 2)), step, closed
+        dev = np.abs(mdl.residual(self.ucen[units]))
+        return 1.5 * float(np.median(dev)), None, False
+
+    def reject_polygon_prisms(self, min_facets=None):
+        """A regular polygonal prism (octagon, 10-, 12-gon) fits a cylinder exactly; only
+        the tessellation density tells it from a coarsely exported hole or boss.
+
+        Exporters tessellate to a chordal (sag) tolerance, often with a maximum angle
+        too, so the sagitta r (1 - cos(step/2)) is about the same on all genuinely curved
+        faces of a part, whatever their radius (small holes get few facets, big ones
+        many). A full-turn 'cylinder' with coarse facets (<= POLY_MAX_FACETS per turn) whose
+        sagitta is over POLY_SAG_RATIO x the part's typical one (median over its other
+        curved regions -- partial fillets, cones, spheres, tori) is a prism. With no other
+        curved region to compare against, only a polygon no exporter would produce is
+        rejected: sagitta > POLY_ABS_SAG and <= POLY_ABS_FACETS facets per turn.
+
+        min_facets (int) overrides all this: full-turn cylinders with fewer facets per
+        turn than that are dropped, others kept."""
+        info = {}
+        for l, kind in enumerate(self.kinds):
+            if kind in ("cyl", "cone", "sphere", "torus"):
+                info[l] = self.region_sagitta(l)
+        cand = [l for l, (sag, step, closed) in info.items()
+                if self.kinds[l] == "cyl" and closed]
+        facets = {l: 2 * np.pi / max(info[l][1], 1e-9) for l in cand}   # per full turn
         drop = []
-        for l, kind, step, span, rad in info:
-            if kind != "cyl" or step < np.radians(30) or span < np.radians(300):
-                continue
-            if any(l2 != l and r2 <= 1.25 * rad and st2 <= step / 2 for l2, _, st2, _, r2 in info):
-                drop.append(l)
+        if min_facets is not None:
+            drop = [l for l in cand if facets[l] < min_facets - 0.5]
+        else:
+            cand = [l for l in cand if facets[l] < POLY_MAX_FACETS + 0.5]
+            ref = [info[l][0] for l in info if l not in cand]
+            typ = float(np.median(ref)) if ref else None
+            for l in cand:
+                sag, step, _ = info[l]
+                if typ is not None:
+                    if sag > POLY_SAG_RATIO * max(typ, 1e-12):
+                        drop.append(l)
+                elif sag > POLY_ABS_SAG and facets[l] < POLY_ABS_FACETS + 0.5:
+                    drop.append(l)
         if not drop:
             return
         keep = [l for l in range(len(self.surfaces)) if l not in drop]
@@ -2101,7 +2140,7 @@ def _refine_boundaries(P, nbr, labels, surfaces, rounds=3):
 
 def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float = 0.5,
             *, max_step_deg: float = 46.0, max_tilt_deg: float = 4.0, min_span_deg: float = 20.0,
-            cones: bool = True) -> tuple[np.ndarray, list]:
+            cones: bool = True, min_cyl_facets: int | None = None) -> tuple[np.ndarray, list]:
     """points (V,3) float64 welded vertices; faces (F,3) int, consistently wound CCW-outward.
     Returns labels (F,) int and surfaces list. labels[i] = index into surfaces, or -1 for a
     freeform triangle that matches nothing (it will stay its own flat facet).
@@ -2112,7 +2151,11 @@ def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float 
                   hexagonal prisms.
     max_tilt_deg  allowed deviation of a facet normal from the ideal (perpendicular to a
                   cylinder axis, constant angle to a cone axis).
-    min_span_deg  minimum angular coverage of a cylinder/cone region."""
+    min_span_deg  minimum angular coverage of a cylinder/cone region.
+    min_cyl_facets  None: tell polygonal prisms from coarse cylinders automatically (by
+                  the part's chordal tolerance, see _Seg.reject_polygon_prisms). An int:
+                  full-turn cylinders with fewer facets per turn than this are left as
+                  flat facets, all others kept (0 keeps every one)."""
     faces = np.asarray(faces, np.int64)
     F = len(faces)
     if F == 0:
@@ -2133,7 +2176,7 @@ def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float 
         if cones:
             s.cones(only=s.deferred & (s.label < 0))
     s.merge()
-    s.reject_polygon_prisms()
+    s.reject_polygon_prisms(min_cyl_facets)
     labels = s.planes()
     labels = _refine_boundaries(s.P, s.nbr, labels, s.surfaces)
     return labels, s.surfaces
