@@ -1,11 +1,15 @@
-# stl2step
+# cad-transmogrifier
+
+*Named after Calvin's cardboard-box Transmogrifier from Bill Watterson's Calvin and Hobbes —
+you put one thing in and something else comes out. (No affiliation, and no artwork here;
+just a fan's nod.)*
 
 Turn an STL or 3MF mesh into a real, editable solid — a STEP file you can open in
 **FreeCAD**, **Onshape** or any other CAD program and actually work with: select a hole
 and change its diameter, sketch on a flat face, add fillets, cut it with booleans.
 
 ```
-./stl2step Orin_nano_case_main.3MF
+./transmogrify Orin_nano_case_main.3MF
 Orin_nano_case_main.3MF: 3304 triangles, 1612 vertices
   prismatic: 77 cone, 47 cylinder, 334 plane faces
   solid volume 76673.817 mm^3, valid
@@ -25,9 +29,33 @@ your files saved to Autodesk's cloud first. Every other tool I tried (FreeCAD in
 just imports the mesh as a mesh — at best a "solid" made of thousands of triangles that
 you can't meaningfully edit.
 
-stl2step is that one conversion step, offline, free, on Linux: mesh in, editable STEP
+cad-transmogrifier is that one conversion step, offline, free, on Linux: mesh in, editable STEP
 out, then do the actual CAD work in FreeCAD or Onshape. It is not affiliated with
 Autodesk.
+
+## Similar projects (go look at these first)
+
+I built this before checking what already existed — which I should have done. Other people
+have put real time and care into this problem, and their projects deserve the credit:
+
+- **[BlinkingSun/stl2step](https://github.com/BlinkingSun/stl2step)** (MIT, C++) — a mature
+  OpenCASCADE-based STL→STEP engine with a CLI, an embeddable library, a WebAssembly build
+  and the SolidOut desktop app. Recovers planes, cylinders and fillets, with mesh repair.
+- **[The-Dorkknight/stl2step](https://github.com/The-Dorkknight/stl2step)** (PolyForm
+  Noncommercial) — a portable browser-based app that also reconstructs cones, spheres, tori
+  and fits NURBS to organic areas; reads STL/OBJ/PLY/3MF and OpenSCAD, with FreeCAD and
+  Fusion plugins.
+- **[build123d](https://github.com/gumyr/build123d)**'s `brep_from_stl.detect_primitives`
+  (Apache 2.0) — detects planes, spheres and cylinders on a mesh as analytic faces inside
+  the build123d CAD library.
+- **FreeCAD** itself: *Part → Create shape from mesh → Convert to solid → Refine shape*
+  gives a faceted solid with coplanar faces merged, and the Reverse Engineering workbench
+  fits surfaces interactively.
+
+What this one adds to that list, for what it's worth: it is open source (LGPL), installs
+with pip, rebuilds cones/spheres/tori as true analytic surfaces, reads slicer 3MF files
+(PrusaSlicer, Bambu Studio, Orca), and repairs broken meshes first. How the tools compare on
+the same files is in [`docs/similar-projects.md`](docs/similar-projects.md).
 
 ## Made with AI — vibe-coded with Claude
 
@@ -51,20 +79,20 @@ OpenCASCADE via [`cadquery-ocp`](https://pypi.org/project/cadquery-ocp/), plus n
 scipy.
 
 ```bash
-git clone https://github.com/themacadocious/stl2step.git
-cd stl2step
+git clone https://github.com/themacadocious/cad-transmogrifier.git
+cd cad-transmogrifier
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-./stl2step part.stl
+./transmogrify part.stl
 ```
 
 ## Usage
 
-    ./stl2step part.stl                 # -> part.step next to it
-    ./stl2step case.3mf                 # 3MF works too (PrusaSlicer, Bambu Studio, Orca)
-    ./stl2step *.stl                    # batch
-    ./stl2step part.stl -o part.iges    # .step/.stp, .iges/.igs or .brep
-    ./stl2step                          # small GUI with a file picker
+    ./transmogrify part.stl                 # -> part.step next to it
+    ./transmogrify case.3mf                 # 3MF works too (PrusaSlicer, Bambu Studio, Orca)
+    ./transmogrify *.stl                    # batch
+    ./transmogrify part.stl -o part.iges    # .step/.stp, .iges/.igs or .brep
+    ./transmogrify                          # small GUI with a file picker
 
 Then in FreeCAD: *File → Import* the `.step`; in Onshape: *Import* it into a Part Studio.
 

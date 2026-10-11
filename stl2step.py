@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""stl2step — turn an STL or 3MF mesh into a real B-rep solid that CAD tools can edit.
+"""cad-transmogrifier — turn an STL or 3MF mesh into a real B-rep solid that CAD tools
+can edit.
 
 Pipeline (same idea as Fusion 360's "Mesh to BRep"):
   1. parse STL, weld duplicate vertices, drop degenerate triangles
@@ -516,7 +517,7 @@ def gui():
     from tkinter import filedialog, scrolledtext, ttk
 
     root = tk.Tk()
-    root.title("Mesh → STEP")
+    root.title("Transmogrifier: mesh → STEP")
     root.geometry("820x420")
 
     merge = tk.BooleanVar(value=True)
@@ -563,7 +564,7 @@ def gui():
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="transmogrify", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="*", help="STL or 3MF files (no args = open the GUI)")
     ap.add_argument("-o", "--output", help="output file (.step/.stp/.iges/.brep); single input only")
     ap.add_argument("--no-merge", action="store_true", help="keep every triangle as its own face")
