@@ -602,6 +602,8 @@ def _snap(p, surfs, iters=10):
     """Alternating projection of a corner onto all analytic surfaces it touches."""
     if not surfs:
         return p
+    if len(surfs) == 1:  # a single projection is already exact
+        iters = 1
     for _ in range(iters):
         for s in surfs:
             k = _kind(s)
@@ -650,7 +652,8 @@ def _assemble(points, faces, labels, surfaces, he, chains, tol):
             touching[v].update((ra, rb))
     pos = {}
     for v, rs in touching.items():
-        pos[v] = _snap(points[v].copy(), [surfaces[r] for r in rs if surfaces[r] is not None])
+        surfs = [surfaces[r] for r in rs if surfaces[r] is not None]
+        pos[v] = _snap(points[v].copy(), surfs) if surfs else points[v]
 
     vtx = {v: BRepBuilderAPI_MakeVertex(_pnt(p)).Vertex() for v, p in pos.items()}
 
@@ -712,7 +715,32 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     made = []
     region_body = {}
 
-    for r, tris in _region_index(labels).items():
+    # curved regions and their neighbours are the only faces this construction can
+    # spoil, so build and check them first: a failure then costs a retry before the
+    # (often tens of thousands of) plain facets have been built for nothing
+    neighbours = defaultdict(set)
+    for (ra, rb), _, _ in chains:
+        neighbours[ra].add(rb)
+        neighbours[rb].add(ra)
+    index = _region_index(labels)
+    curvedish = {r for r in index if _is_curved(surfaces[r])}
+    curvedish |= {x for r in curvedish for x in neighbours[r]}
+    order = sorted(curvedish) + [r for r in index if r not in curvedish]
+    blame, poly = set(), set()
+
+    def check_curvedish():
+        for r, f in made:
+            if not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
+                # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
+                blame.update({r} if _is_curved(surfaces[r])
+                             else (x for x in neighbours[r] if _is_curved(surfaces[x])))
+        if blame:
+            raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
+
+    for k, r in enumerate(order):
+        if k == len(curvedish):
+            check_curvedish()
+        tris = index[r]
         surf = surfaces[r]
         loops = _boundary_loops(faces, r, tris, he, labels)
         wires = []
@@ -788,27 +816,19 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
 
     # a face that came out invalid is almost always a curved surface whose boundary
     # didn't sit well on it (or a plane next to one): demote those and let rebuild() retry
-    neighbours = defaultdict(set)
-    for (ra, rb), _, _ in chains:
-        neighbours[ra].add(rb)
-        neighbours[rb].add(ra)
-    blame, poly = set(), set()
-    curvedish = {r for r, _ in made if _is_curved(surfaces[r])}
-    curvedish |= {x for r in curvedish for x in neighbours[r]}
-    for r, f in made:
-        # only curved faces and their neighbours can be spoiled by this construction;
-        # anything else is caught by the per-body check below
-        if r in curvedish and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
-            # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
-            blame.update({r} if _is_curved(surfaces[r])
-                         else (x for x in neighbours[r] if _is_curved(surfaces[x])))
-    if blame:
-        raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
+    if len(order) == len(curvedish):
+        check_curvedish()
 
     # each body is checked once; the whole-shape ShapeFix (seconds on big meshes) only
     # runs if a body actually needs it
     out = solid
     bad_solids = _bad_solids(out, len(solids))
+    if bad_solids:
+        # usually edges whose parametrisation/tolerances no longer match after corners
+        # were snapped: re-syncing them is ~7x cheaper than a whole-shape ShapeFix
+        BRepLib.SameParameter_s(out, tol, True)
+        BRepLib.UpdateTolerances_s(out, False)
+        bad_solids = _bad_solids(out, len(solids))
     if bad_solids:
         final = ShapeFix_Shape(solid)
         final.Perform()
@@ -891,20 +911,14 @@ def _point_in_mesh(p, tris):
 
 
 def _bodies(faces, he):
-    """Connected-component id per triangle."""
-    parent = np.arange(len(faces))
+    """Connected-component id per triangle (triangles joined across shared edges)."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for (a, b), (t, _) in he.items():
-        u, v = find(t), find(he[(b, a)][0])
-        if u != v:
-            parent[u] = v
-    return np.array([find(t) for t in range(len(faces))])
+    t1 = np.fromiter((t for (a, b), (t, _) in he.items() if a < b), np.int64)
+    t2 = np.fromiter((he[(b, a)][0] for (a, b), _ in he.items() if a < b), np.int64)
+    graph = coo_matrix((np.ones(len(t1)), (t1, t2)), shape=(len(faces), len(faces)))
+    return connected_components(graph, directed=False)[1]
 
 
 def _polyline_dist(q, poly):
@@ -1030,10 +1044,11 @@ def _chain_starts_here(loop, i, half_to_chain, chains):
 def _make_face(surf, wires, points, faces, tris, tol, reshape):
     if surf is None:
         # freeform triangle: its own plane
-        t = faces[tris[0]]
-        p = points[t]
-        n = np.cross(p[1] - p[0], p[2] - p[0])
-        surf_pln = gp_Pln(_pnt(p[0]), _dir(n / np.linalg.norm(n)))
+        # plain floats: a numpy call per facet costs more than the facet itself
+        (x0, y0, z0), (x1, y1, z1), (x2, y2, z2) = points[faces[tris[0]]].tolist()
+        ux, uy, uz, vx, vy, vz = x1 - x0, y1 - y0, z1 - z0, x2 - x0, y2 - y0, z2 - z0
+        surf_pln = gp_Pln(gp_Pnt(x0, y0, z0),
+                          gp_Dir(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx))
         mk = BRepBuilderAPI_MakeFace(surf_pln, wires[0][0], True)
         if not mk.IsDone():
             raise RebuildError("facet face failed")
