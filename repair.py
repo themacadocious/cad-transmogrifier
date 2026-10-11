@@ -21,9 +21,17 @@ clean, outward-oriented closed manifold comes back as the *same* arrays):
   3. consistent winding per connected component (orientation propagation)
   4. boundary repair: split edges at T-junctions, snap near-coincident boundary vertices,
      then fill remaining small near-planar holes by ear clipping
+  4a. needles — edges shorter than CAP_TOL_MULT × tol — are collapsed (link condition,
+     no fold, no degenerate/duplicate triangle), to the midpoint or the end that moves
+     the surface least
   4b. caps — triangles whose apex lies within CAP_TOL_MULT × tol of the interior of their
      longest edge (OCCT rejects such faces) — are removed by flipping that edge with the
      triangle across it; no vertex moves
+  4c. self-intersections inside one shell (grid broad phase + vectorised separating-axis
+     test; pairs sharing a vertex and crossings between different shells are ignored):
+     small clusters are cut out with a one-ring and the holes re-filled; clusters over
+     SI_MAX_AREA_FRAC of their shell, or whose holes can't be filled cleanly, are left
+     and reported as a WARNING
   5. drop tiny disconnected slivers (≈zero volume, negligible area) — reported, never silent
   6. orient every closed component outward; a shell fully inside another one (an internal
      void) points inward
@@ -149,7 +157,7 @@ def _parity(tri):
 
 
 def diagnose(points, faces, tol=None):
-    """Counts of mesh defects. `self_intersections` is None (not computed)."""
+    """Counts of mesh defects. `self_intersections`: crossing triangle pairs within one shell."""
     points = np.asarray(points, float)
     faces = np.asarray(faces)
     if tol is None:
@@ -157,8 +165,8 @@ def diagnose(points, faces, tol=None):
     out = dict(triangles=int(len(faces)), vertices=int(len(points)))
     if len(faces) == 0:
         out.update(boundary_edges=0, nonmanifold_edges=0, inconsistent_edges=0, components=0,
-                   closed_components=0, degenerate=0, duplicate=0, caps=0, volume=0.0,
-                   self_intersections=None, closed_manifold=False)
+                   closed_components=0, degenerate=0, duplicate=0, caps=0, needles=0, volume=0.0,
+                   self_intersections=0, closed_manifold=False)
         return out
     deg = _degenerate_mask(points, faces, tol)
     dups = sum(len(g) - 1 for g in _duplicate_groups(faces))
@@ -178,7 +186,8 @@ def diagnose(points, faces, tol=None):
         duplicate=int(dups),
         volume=float(vol.sum()),
         caps=int(_cap_mask(points, faces, CAP_TOL_MULT * tol).sum()),
-        self_intersections=None,
+        needles=int(_needle_edges(points, faces, CAP_TOL_MULT * tol).sum()),
+        self_intersections=int(len(_self_intersections(points, faces, tol, lab))),
     )
     out["closed_manifold"] = (out["boundary_edges"] == 0 and out["nonmanifold_edges"] == 0
                               and out["inconsistent_edges"] == 0 and out["degenerate"] == 0
@@ -189,7 +198,7 @@ def diagnose(points, faces, tol=None):
 # ------------------------------------------------------------------ repair
 
 def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: bool = True,
-           cap_tol: float = None):
+           cap_tol: float = None, self_intersections: bool = True):
     """Return (points, faces, notes). `points` (V,3) welded vertices, `faces` (F,3) ints,
     `tol` the weld tolerance. Notes are human-readable lines about what was changed; when
     nothing needed fixing the input arrays are returned unchanged and notes is empty.
@@ -199,7 +208,11 @@ def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: b
     shells that are not inside anything (e.g. for multi-body STLs with embedded bodies).
 
     cap_tol: triangles whose apex is closer than this to the interior of their longest edge
-    ("caps") are removed by flipping that edge (default CAP_TOL_MULT × tol; 0 disables)."""
+    ("caps") are removed by flipping that edge, and edges shorter than it ("needles") are
+    collapsed (default CAP_TOL_MULT × tol; 0 disables both).
+
+    self_intersections: cut out and re-fill small clusters of triangles of one shell that
+    cross each other (crossings between separate shells are left alone)."""
     points_in, faces_in = points, faces
     points = np.asarray(points, float)
     faces = np.asarray(faces)
@@ -273,12 +286,28 @@ def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: b
             notes.append(f"flipped {nflip} triangles to make winding consistent")
             t = _Topo(F, len(P))
 
-    # 4b. cap triangles (apex almost on the opposite edge): OCCT rejects those faces
     cap_tol = CAP_TOL_MULT * tol if cap_tol is None else cap_tol
+    # 4a. needles (an edge shorter than cap_tol): collapse it
+    if cap_tol > 0 and _needle_edges(P, F, cap_tol).any():
+        P, F, msgs = _collapse_needles(P, F, cap_tol, tol)
+        if msgs:
+            notes += msgs
+            changed = True
+            t = _Topo(F, len(P))
+
+    # 4b. cap triangles (apex almost on the opposite edge): OCCT rejects those faces
     if cap_tol > 0 and _cap_mask(P, F, cap_tol).any():
         F, msgs = _remove_caps(P, F, cap_tol, tol)
         if msgs:
             notes += msgs
+            changed = True
+            t = _Topo(F, len(P))
+
+    # 4c. self-intersections inside one shell (between shells is fine: fused later)
+    if self_intersections:
+        F, msgs, ch = _fix_self_intersections(P, F, tol)
+        notes += msgs
+        if ch:
             changed = True
             t = _Topo(F, len(P))
 
@@ -288,7 +317,7 @@ def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: b
     changed |= ch
 
     if not changed:
-        return points_in, faces_in, []
+        return points_in, faces_in, notes       # notes: only warnings about what was left
 
     # compact: drop unreferenced vertices
     used = np.unique(F)
@@ -1009,3 +1038,481 @@ def _nesting_depth(P, F, lab, closed, samples=5):
             if _points_in_mesh(Q, P[F[mem[closed[j]]]]).all():
                 depth[i] += 1
     return depth
+
+
+# ------------------------------------------------------------------ step 4a: needles
+
+def _vertex_faces(F, nv):
+    """CSR vertex -> incident faces."""
+    fl = F.ravel()
+    order = np.argsort(fl, kind="stable")
+    ptr = np.searchsorted(fl[order], np.arange(nv + 1))
+    return order // 3, ptr
+
+
+def _needle_edges(P, F, cap_tol):
+    T = P[F]
+    L = np.linalg.norm(T[:, [1, 2, 0]] - T, axis=2)
+    return L.min(axis=1) < cap_tol
+
+
+def _collapse_needles(P, F, cap_tol, tol, rounds=20):
+    """Collapse every interior edge shorter than cap_tol to whichever of (its midpoint,
+    either end) moves the surface least. A collapse is applied only if it passes the
+    link condition (the two end vertices share exactly the two opposite vertices, so the
+    mesh stays manifold), leaves no degenerate or duplicate triangle and turns no
+    surviving triangle by more than CAP_FOLD_DEG."""
+    n0 = int(_needle_edges(P, F, cap_tol).sum())
+    P = P.copy()
+    F = F.copy()
+    alive = np.ones(len(F), bool)
+    cos_fold = np.cos(np.radians(CAP_FOLD_DEG))
+    ncol, worst = 0, 0.0
+    for _ in range(rounds):
+        Fa = F[alive]
+        idx_alive = np.flatnonzero(alive)
+        t = _Topo(Fa, len(P))
+        L = np.linalg.norm(P[t.edges[:, 0]] - P[t.edges[:, 1]], axis=1)
+        short = np.flatnonzero((L < cap_tol) & (t.cnt == 2))
+        if not len(short):
+            break
+        short = short[np.argsort(L[short])]
+        vf_order, vf_ptr = _vertex_faces(Fa, len(P))
+        locked = np.zeros(len(P), bool)
+        done = 0
+        for e in short.tolist():
+            u, v = (int(x) for x in t.edges[e])
+            if locked[u] or locked[v]:
+                continue
+            fu = idx_alive[vf_order[vf_ptr[u]:vf_ptr[u + 1]]]
+            fv = idx_alive[vf_order[vf_ptr[v]:vf_ptr[v + 1]]]
+            both = np.intersect1d(fu, fv)
+            if len(both) != 2:
+                continue
+            ring_u = set(F[fu].ravel().tolist()) - {u}
+            ring_v = set(F[fv].ravel().tolist()) - {v}
+            opp = set(F[both].ravel().tolist()) - {u, v}
+            if (ring_u & ring_v) != opp or len(opp) != 2:
+                continue
+            keep = np.setdiff1d(np.union1d(fu, fv), both)
+            old = P[F[keep]]
+            n_old = np.cross(old[:, 1] - old[:, 0], old[:, 2] - old[:, 0])
+            a_old = np.linalg.norm(n_old, axis=1)
+            h_old, _, _, _ = _cap_info(P, F[keep])
+            solid = (a_old > 0) & (h_old >= cap_tol)            # trustworthy normals
+            n_old = n_old / np.maximum(a_old, 1e-300)[:, None]
+            newf = np.where(F[keep] == v, u, F[keep])
+            if len({tuple(sorted(x)) for x in newf.tolist()}) != len(newf):
+                continue
+            best = None
+            for x in (0.5 * (P[u] + P[v]), P[u], P[v]):
+                pts = P[newf]
+                pts[newf == u] = x
+                n_new = np.cross(pts[:, 1] - pts[:, 0], pts[:, 2] - pts[:, 0])
+                a_new = np.linalg.norm(n_new, axis=1)
+                if (a_new <= tol * tol).any():
+                    continue
+                cosang = np.einsum("ij,ij->i", n_new / a_new[:, None], n_old)
+                if (cosang[solid] < cos_fold).any():
+                    continue
+                err = np.abs(np.einsum("ij,ij->i", x - old[:, 0], n_old))[solid]
+                err = float(err.max()) if len(err) else 0.0
+                if best is None or err < best[0]:
+                    best = (err, x)
+            if best is None:
+                continue
+            P[u] = best[1]
+            F[keep] = newf
+            alive[both] = False
+            locked[list(ring_u | ring_v | {u, v})] = True
+            worst = max(worst, best[0])
+            done += 1
+        ncol += done
+        if not done:
+            break
+    if not ncol:
+        return P, F, []
+    F = F[alive]
+    left = int(_needle_edges(P, F, cap_tol).sum())
+    msgs = [f"collapsed {ncol} needle edges shorter than {cap_tol:.3g}: {n0} -> {left} needle triangles "
+            f"(surface moved ≤ {worst:.2g})"]
+    return P, F, msgs
+
+
+# ------------------------------------------------------------------ step 4c: self-intersections
+
+SI_MAX_AREA_FRAC = 0.01     # a cluster larger than this fraction of its shell is left alone
+SI_ITER = 3
+SI_DEPTH_MULT = 10.0        # crossings shallower than this × tol (= cap_tol) are contact
+SI_CHUNK = 40000
+
+
+def _ranges(n):
+    """For counts n: (owner index, offset within owner) of sum(n) items."""
+    n = np.asarray(n, np.int64)
+    own = np.repeat(np.arange(len(n)), n)
+    off = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
+    return own, off
+
+
+_OFFS = np.array([[i, j, k] for i in (0, 1) for j in (0, 1) for k in (0, 1)])
+
+
+def _tri_cells(T, s, base):
+    """(triangle index, cell) for every grid cell of size s a triangle touches. Triangles
+    whose bbox spans ≤ 2 cells per axis use their bbox cells; bigger ones are rasterised."""
+    c0 = np.floor((T.min(axis=1) - base) / s).astype(np.int64)
+    c1 = np.floor((T.max(axis=1) - base) / s).astype(np.int64)
+    small = np.all(c1 - c0 <= 1, axis=1)
+    si = np.flatnonzero(small)
+    out_t, out_c = [], []
+    a0, a1 = c0[si], c1[si]
+    for o in _OFFS:
+        ok = np.all(a0 + o <= a1, axis=1)
+        out_t.append(si[ok])
+        out_c.append(a0[ok] + o)
+    bi = np.flatnonzero(~small)
+    if len(bi):
+        bt, bc = _big_tri_cells(T[bi], s, base)
+        out_t.append(bi[bt])
+        out_c.append(bc)
+    return np.concatenate(out_t), np.concatenate(out_c)
+
+
+def _big_tri_cells(T, s, base, chunk=20000):
+    """Grid cells (i,j,k) touched by large triangles, without enumerating their whole
+    bounding box: walk the cell columns along the triangle's dominant normal axis that
+    the projected triangle overlaps (2D separating-axis test) and take the 1-4 cells the
+    plane passes through in each column."""
+    out_t, out_c = [], []
+    for c0 in range(0, len(T), chunk):
+        X = (T[c0:c0 + chunk] - base) / s
+        n = np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0])
+        k = np.abs(n).argmax(axis=1)
+        i, j = (k + 1) % 3, (k + 2) % 3
+        r = np.arange(len(X))
+        U = np.take_along_axis(X, i[:, None, None].repeat(3, 1), axis=2)[:, :, 0]
+        V = np.take_along_axis(X, j[:, None, None].repeat(3, 1), axis=2)[:, :, 0]
+        W = np.take_along_axis(X, k[:, None, None].repeat(3, 1), axis=2)[:, :, 0]
+        u0, u1 = np.floor(U.min(1)).astype(np.int64), np.floor(U.max(1)).astype(np.int64)
+        v0, v1 = np.floor(V.min(1)).astype(np.int64), np.floor(V.max(1)).astype(np.int64)
+        nu, nv = u1 - u0 + 1, v1 - v0 + 1
+        own, off = _ranges(nu * nv)
+        cu = u0[own] + off // nv[own]
+        cv = v0[own] + off % nv[own]
+        # 2D SAT: projected triangle vs the unit square [cu, cu+1] x [cv, cv+1]
+        keep = np.ones(len(own), bool)
+        for e in range(3):
+            a_u, a_v = U[own, e], V[own, e]
+            b_u, b_v = U[own, (e + 1) % 3], V[own, (e + 1) % 3]
+            c_u, c_v = U[own, (e + 2) % 3], V[own, (e + 2) % 3]
+            nu_, nv_ = b_v - a_v, a_u - b_u                     # edge normal
+            side = nu_ * (c_u - a_u) + nv_ * (c_v - a_v)        # where the triangle is
+            sgn = np.sign(side)
+            # most "inside" corner of the square along the normal
+            cu_best = cu + (sgn * nu_ > 0)
+            cv_best = cv + (sgn * nv_ > 0)
+            proj = sgn * (nu_ * (cu_best - a_u) + nv_ * (cv_best - a_v))
+            keep &= (proj >= -1e-9) | (sgn == 0)
+        own, cu, cv = own[keep], cu[keep], cv[keep]
+        # plane height range over the column
+        nn = n[own]
+        kk = k[own]
+        nk = np.take_along_axis(nn, kk[:, None], 1)[:, 0]
+        ni = np.take_along_axis(nn, ((kk + 1) % 3)[:, None], 1)[:, 0]
+        nj = np.take_along_axis(nn, ((kk + 2) % 3)[:, None], 1)[:, 0]
+        d = ni * U[own, 0] + nj * V[own, 0] + nk * W[own, 0]
+        ws = [(d - ni * (cu + du) - nj * (cv + dv)) / nk for du in (0, 1) for dv in (0, 1)]
+        ws = np.stack(ws, 1)
+        w0 = np.floor(np.clip(ws.min(1), W[own].min(1), W[own].max(1))).astype(np.int64)
+        w1 = np.floor(np.clip(ws.max(1), W[own].min(1), W[own].max(1))).astype(np.int64)
+        own2, off2 = _ranges(w1 - w0 + 1)
+        cw = w0[own2] + off2
+        cell = np.zeros((len(own2), 3), np.int64)
+        rr = np.arange(len(own2))
+        o = own[own2]
+        cell[rr, i[o]] = cu[own2]
+        cell[rr, j[o]] = cv[own2]
+        cell[rr, k[o]] = cw
+        out_t.append(c0 + o)
+        out_c.append(cell)
+    return np.concatenate(out_t), np.concatenate(out_c)
+
+
+def _candidate_pairs(T, F=None, tol=0.0, chunk=2_000_000):
+    """Triangle pairs that may touch, from a multi-level uniform grid. Each triangle is
+    rasterised (only the cells its plane actually crosses) at the level whose cell size
+    matches its own size (≈ sqrt(area), so slivers are not filed by their length), and
+    looked up in every coarser level. Pairs are kept only if their bounding boxes overlap
+    (by more than tol) and, when F is given, they share no vertex. Returns (a, b), a < b."""
+    if len(T) < 2:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    lo, hi = T.min(axis=1), T.max(axis=1)
+    ext = (hi - lo).max(axis=1)
+    span = float((hi.max(axis=0) - lo.min(axis=0)).max())
+    if span == 0:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    area2 = np.linalg.norm(np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]), axis=1)
+    m = np.maximum(np.minimum(ext, np.maximum(2 * np.sqrt(area2), ext / 16)), span / 2 ** 16)
+    s0 = float(np.percentile(m, 2))
+    lvl = np.maximum(0, np.ceil(np.log2(m / s0))).astype(np.int64)
+    base = lo.min(axis=0)
+    B = np.int64(1 << 18)
+    pa, pb = [], []
+
+    def emit(a, b):
+        for i in range(0, len(a), chunk):
+            x, y = a[i:i + chunk], b[i:i + chunk]
+            ok = x != y
+            for k in range(3):
+                ok &= (lo[x, k] < hi[y, k] - tol) & (lo[y, k] < hi[x, k] - tol)
+            x, y = x[ok], y[ok]
+            if F is not None:
+                Fx, Fy = F[x], F[y]
+                sh = np.zeros(len(x), bool)
+                for p in range(3):
+                    for q in range(3):
+                        sh |= Fx[:, p] == Fy[:, q]
+                x, y = x[~sh], y[~sh]
+            pa.append(x)
+            pb.append(y)
+    levels = np.unique(lvl).tolist()
+    for lv in levels:
+        s = s0 * 2.0 ** lv
+        ins = np.flatnonzero(lvl == lv)
+        it, ic = _tri_cells(T[ins], s, base)
+        it = ins[it]
+        ik = (ic[:, 0] * B + ic[:, 1]) * B + ic[:, 2]
+        order = np.argsort(ik, kind="stable")
+        ik, it = ik[order], it[order]
+        start = np.r_[0, np.flatnonzero(np.diff(ik)) + 1]
+        size = np.diff(np.r_[start, len(ik)])
+        gid = np.repeat(np.arange(len(start)), size)
+        rep = size[gid] - (np.arange(len(ik)) - start[gid]) - 1
+        own, off = _ranges(rep)
+        emit(it[own], it[own + 1 + off])
+        fin = np.flatnonzero(lvl < lv)
+        if len(fin):
+            qt, qc = _tri_cells(T[fin], s, base)
+            qt = fin[qt]
+            qk = (qc[:, 0] * B + qc[:, 1]) * B + qc[:, 2]
+            g = np.searchsorted(ik, qk)
+            g = np.minimum(g, len(ik) - 1)
+            hit = ik[g] == qk
+            qt, qk = qt[hit], qk[hit]
+            gi = np.searchsorted(ik[start], qk)              # group index of each query
+            own, off = _ranges(size[gi])
+            emit(qt[own], it[start[gi][own] + off])
+    a, b = np.concatenate(pa), np.concatenate(pb)
+    if not len(a):
+        return a, b
+    lo_, hi_ = np.minimum(a, b), np.maximum(a, b)
+    nT = np.int64(len(T))
+    pk = np.unique(lo_ * nT + hi_)
+    pk = pk[(pk // nT) != (pk % nT)]
+    return pk // nT, pk % nT
+
+
+def _tri_tri_sat(A, B, eps):
+    """Vectorised separating-axis test for triangle pairs (n,3,3). True where the
+    triangles overlap by more than eps (touching / sharing a point does not count)."""
+    eA = A[:, [1, 2, 0]] - A
+    eB = B[:, [1, 2, 0]] - B
+    nA = np.cross(eA[:, 0], eA[:, 1])
+    nB = np.cross(eB[:, 0], eB[:, 1])
+    ax = [nA[:, None], nB[:, None],
+          np.cross(eA[:, :, None], eB[:, None, :]).reshape(len(A), 9, 3),
+          np.cross(nA[:, None], eA), np.cross(nB[:, None], eB)]
+    ax = np.concatenate(ax, axis=1)                                  # (n, 17, 3)
+    ln = np.linalg.norm(ax, axis=2)
+    scale = np.maximum(np.linalg.norm(eA, axis=2).max(1), np.linalg.norm(eB, axis=2).max(1))
+    valid = ln > 1e-9 * scale[:, None] ** 2
+    ax = ax / np.where(valid, ln, 1)[:, :, None]
+    pa = np.einsum("nvk,nak->nav", A, ax)
+    pb = np.einsum("nvk,nak->nav", B, ax)
+    # touching (overlap ≤ eps) counts as separated, except along a face normal (or an
+    # edge-cross axis parallel to one): there only a real gap separates, otherwise
+    # coplanar overlapping triangles would always look "touching"
+    sep = (pa.max(2) <= pb.min(2) + eps) | (pb.max(2) <= pa.min(2) + eps)
+    gap = (pa.max(2) < pb.min(2) - eps) | (pb.max(2) < pa.min(2) - eps)
+    nAh = nA / np.maximum(np.linalg.norm(nA, axis=1), 1e-300)[:, None]
+    nBh = nB / np.maximum(np.linalg.norm(nB, axis=1), 1e-300)[:, None]
+    along_n = (np.abs(np.einsum("nak,nk->na", ax, nAh)) > 1 - 1e-9) | \
+              (np.abs(np.einsum("nak,nk->na", ax, nBh)) > 1 - 1e-9)
+    sep = np.where(along_n, gap, sep)
+    return ~np.any(sep & valid, axis=1)
+
+
+def _self_intersections(P, F, tol, lab=None):
+    """(k, 2) pairs of triangles of the same shell that cross each other. Pairs sharing
+    a vertex are skipped; triangles in different shells are ignored."""
+    if len(F) < 2:
+        return np.zeros((0, 2), np.int64)
+    if lab is None:
+        t = _Topo(F, len(P))
+        pairs, _ = t.pairs(t.cnt == 2)
+        _, lab = _components(len(F), pairs)
+    T = P[F]
+    a, b = _candidate_pairs(T, F, tol)
+    keep = lab[a] == lab[b]
+    a, b = a[keep], b[keep]
+    # plane test: a proper crossing needs each triangle to have vertices clearly on
+    # both sides of the other's plane (coplanar pairs go on to the in-plane test).
+    # A triangle merely touching the other's plane, or crossing it by less than eps,
+    # is contact, not a self-intersection.
+    eps = SI_DEPTH_MULT * tol
+    n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None]
+    straddle = np.ones(len(a), bool)
+    coplanar = np.ones(len(a), bool)
+    for x, y in ((a, b), (b, a)):
+        d = np.einsum("pvk,pk->pv", T[y] - T[x][:, None, 0], n[x])
+        straddle &= (d.max(axis=1) > eps) & (d.min(axis=1) < -eps)
+        coplanar &= np.abs(d).max(axis=1) <= eps
+    keep = straddle | coplanar
+    a, b = a[keep], b[keep]
+    hit = np.zeros(len(a), bool)
+    for i in range(0, len(a), SI_CHUNK):
+        hit[i:i + SI_CHUNK] = _tri_tri_sat(T[a[i:i + SI_CHUNK]], T[b[i:i + SI_CHUNK]], eps)
+    return np.stack([a[hit], b[hit]], axis=1)
+
+
+def _loops_from_halfedges(he):
+    """Chain directed edges (u->v) into closed loops; None if they don't close up."""
+    nxt = defaultdict(list)
+    for i, (u, v) in enumerate(he.tolist()):
+        nxt[u].append(i)
+    used = np.zeros(len(he), bool)
+    loops = []
+    for i0 in range(len(he)):
+        if used[i0]:
+            continue
+        loop, i = [], i0
+        while True:
+            used[i] = True
+            loop.append(int(he[i, 0]))
+            cand = [j for j in nxt[int(he[i, 1])] if not used[j]]
+            if int(he[i, 1]) == loop[0]:
+                break
+            if not cand:
+                return None
+            i = cand[0]
+        loops.append(loop)
+    return loops
+
+
+def _fill_is_clean(fill, P, F, t, fs, cnt_in, vf, tol):
+    """A hole fill must not reuse an edge that survives elsewhere in the mesh (other than
+    the hole's own rim) and must not duplicate a surviving triangle."""
+    if _degenerate_mask(P, fill, tol).any():
+        return False
+    nv = max(len(P), 1)
+    ukey = t.edges[:, 0] * nv + t.edges[:, 1]
+    he = np.stack([fill, np.roll(fill, -1, axis=1)], axis=2).reshape(-1, 2)
+    lo, hi = he.min(axis=1), he.max(axis=1)
+    k = lo.astype(np.int64) * nv + hi
+    uk, c = np.unique(k, return_counts=True)
+    i = np.minimum(np.searchsorted(ukey, uk), len(ukey) - 1)
+    exists = ukey[i] == uk
+    removed = exists & (cnt_in[i] == t.cnt[i])        # interior to the cut-out cluster
+    rim = exists & ~removed                            # surviving edge: the hole's rim
+    if (rim & (c != 1)).any() or ((~rim) & (c != 2)).any():
+        return False
+    order, ptr = vf
+    gone = set(fs.tolist())
+    for tri in fill.tolist():
+        a = tri[0]
+        for g in order[ptr[a]:ptr[a + 1]].tolist():
+            if g not in gone and sorted(F[g].tolist()) == sorted(tri):
+                return False
+    return True
+
+
+def _fix_self_intersections(P, F, tol):
+    """MeshLab-style: drop the crossing triangles plus a one-ring around them and close
+    the holes with the hole filler. Clusters larger than SI_MAX_AREA_FRAC of their shell,
+    or whose holes can't be filled, are left alone and reported."""
+    msgs = []
+    n_first = None
+    removed_area = 0.0
+    nclusters = 0
+    skipped = []
+    for _ in range(SI_ITER):
+        t = _Topo(F, len(P))
+        pairs, _ = t.pairs(t.cnt == 2)
+        _, lab = _components(len(F), pairs)
+        hits = _self_intersections(P, F, tol, lab)
+        if n_first is None:
+            n_first = len(hits)
+        if not len(hits):
+            break
+        bad = np.unique(hits)
+        vm = np.zeros(len(P), bool)
+        vm[F[bad]] = True
+        ring = np.flatnonzero(vm[F].any(axis=1))
+        # clusters: ring faces connected through shared edges
+        inring = np.zeros(len(F), bool)
+        inring[ring] = True
+        cp = pairs[inring[pairs[:, 0]] & inring[pairs[:, 1]]]
+        _, clab = _components(len(F), cp)
+        _, ar, _ = _tri_props(P, F)
+        shell_area = np.bincount(lab, weights=ar)
+        drop = np.zeros(len(F), bool)
+        new = []
+        progress = False
+        vf = _vertex_faces(F, len(P))
+        for c in np.unique(clab[ring]).tolist():
+            fs = ring[clab[ring] == c]
+            area = ar[fs].sum()
+            if area > SI_MAX_AREA_FRAC * shell_area[lab[fs[0]]]:
+                skipped.append(f"{len(fs)} triangles, {100 * area / shell_area[lab[fs[0]]]:.2g}% of the shell")
+                continue
+            # hole boundary as half-edges of the triangles that stay (reverse of ours)
+            hh = (3 * fs[:, None] + np.arange(3)).ravel()
+            m = np.zeros(len(F), bool)
+            m[fs] = True
+            mate_in = np.zeros(len(hh), bool)
+            e = t.inv[hh]
+            # an edge is interior to the cluster if all its triangles are in the cluster
+            sel = np.flatnonzero(m[t.hface])
+            cnt_in = np.bincount(t.inv[sel], minlength=len(t.cnt))
+            mate_in = cnt_in[e] == t.cnt[e]
+            he = t.he[hh[~mate_in]][:, ::-1]
+            loops = _loops_from_halfedges(he)
+            if loops is None:
+                skipped.append(f"{len(fs)} triangles, hole not a clean loop")
+                continue
+            fill = []
+            for vs in loops:
+                X = P[vs]
+                perim = float(np.linalg.norm(np.roll(X, -1, axis=0) - X, axis=1).sum())
+                tri = _fill_loop(X, perim) if 3 <= len(vs) <= HOLE_MAX_EDGES else None
+                if tri is None:
+                    fill = None
+                    break
+                va = np.array(vs)
+                fill += [va[[i, k, j]] for i, j, k in tri]
+            if fill is None:
+                skipped.append(f"{len(fs)} triangles, hole not fillable")
+                continue
+            if not _fill_is_clean(np.array(fill), P, F, t, fs, cnt_in, vf, tol):
+                skipped.append(f"{len(fs)} triangles, fill would not be manifold")
+                continue
+            drop[fs] = True
+            new += fill
+            removed_area += area
+            nclusters += 1
+            progress = True
+        if not progress:
+            break
+        F = F[~drop]
+        if new:
+            F = np.vstack([F, np.array(new, dtype=F.dtype)])
+    left = len(_self_intersections(P, F, tol)) if nclusters else n_first
+    if nclusters:
+        msgs.append(f"self-intersections: {n_first} -> {left} crossing triangle pairs "
+                    f"(cut out {nclusters} cluster(s), area {removed_area:.3g}, and re-filled the holes)")
+    if left:
+        msgs.append(f"WARNING: {left} self-intersecting triangle pairs left"
+                    + (" (" + "; ".join(sorted(set(skipped))[:3]) + ")" if skipped else ""))
+    return F, msgs, bool(nclusters)

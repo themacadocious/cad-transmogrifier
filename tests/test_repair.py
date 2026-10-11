@@ -316,3 +316,122 @@ def test_fat_triangle_is_not_a_cap():
     assert repair.diagnose(p, f, TOL)["caps"] == 0
     p2, f2, notes = repair.repair(p, f, TOL)
     assert notes == [] and f2 is f
+
+
+# ---------------------------------------------------------------- needles
+
+def test_needle_collapsed():
+    # w sits 5e-6 from corner 6 on the 6-7 edge: (4,6,w) and (2,w,6) are needles
+    p, f = box()
+    p = np.vstack([p, p[6] + [-5e-6, 0, 0]])                 # w = 8
+    top = [i for i, t in enumerate(f.tolist()) if t == [4, 6, 7]][0]
+    back = [i for i, t in enumerate(f.tolist()) if t == [2, 7, 6]][0]
+    f = np.vstack([np.delete(f, [top, back], axis=0),
+                   [[4, 6, 8], [4, 8, 7], [2, 7, 8], [2, 8, 6]]])
+    d = repair.diagnose(p, f, TOL)
+    assert d["closed_manifold"] and d["needles"] == 2
+    p2, f2, notes = repair.repair(p, f, TOL)
+    d2 = check(p2, f2, 1.0, shells=1)
+    assert d2["needles"] == 0 and len(f2) == 12
+    assert any("needle" in n for n in notes)
+    assert_solid(p2, f2, 1.0)
+
+
+def test_needle_collapse_respects_link_condition():
+    # a tetrahedron-like tiny closed shell: collapsing its short edge would leave two
+    # back-to-back triangles, so it must be refused (the shell is a sliver and dropped)
+    p, f = box((0, 0, 0), 10.0)
+    q = np.array([[20, 0, 0], [20 + 5e-6, 0, 0], [20, 1, 0], [20, 0, 1]], float)
+    tf = np.array([[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]])
+    P, F = merge((p, f), (q, tf))
+    p2, f2, notes = repair.repair(P, F, TOL)
+    d = repair.diagnose(p2, f2, TOL)
+    assert d["closed_manifold"] and d["duplicate"] == 0
+
+
+# ---------------------------------------------------------------- self-intersections
+
+def grid_box(size=(20.0, 20.0, 1.0), step=0.5):
+    """Closed box whose faces are regular triangle grids (welded, outward-wound)."""
+    sx, sy, sz = size
+    tris = []
+
+    def face(origin, u, v, nu, nv):
+        o, u, v = (np.asarray(x, float) for x in (origin, u, v))
+        for i in range(nu):
+            for j in range(nv):
+                a = o + u * i / nu + v * j / nv
+                b = o + u * (i + 1) / nu + v * j / nv
+                c = o + u * (i + 1) / nu + v * (j + 1) / nv
+                d = o + u * i / nu + v * (j + 1) / nv
+                tris.extend([[a, b, c], [a, c, d]])
+    n = lambda length: max(1, int(round(length / step)))  # noqa: E731
+    face((0, 0, 0), (0, sy, 0), (sx, 0, 0), n(sy), n(sx))          # z=0, normal -z
+    face((0, 0, sz), (sx, 0, 0), (0, sy, 0), n(sx), n(sy))         # z=sz, +z
+    face((0, 0, 0), (sx, 0, 0), (0, 0, sz), n(sx), n(sz))          # y=0, -y
+    face((0, sy, 0), (0, 0, sz), (sx, 0, 0), n(sz), n(sx))         # y=sy, +y
+    face((0, 0, 0), (0, 0, sz), (0, sy, 0), n(sz), n(sy))          # x=0, -x
+    face((sx, 0, 0), (0, sy, 0), (0, 0, sz), n(sy), n(sz))         # x=sx, +x
+    T = np.array(tris)
+    return weld_points(T.reshape(-1, 3), np.arange(len(T) * 3).reshape(-1, 3))
+
+
+def test_grid_box_is_clean():
+    p, f = grid_box()
+    d = repair.diagnose(p, f)
+    assert d["closed_manifold"] and d["self_intersections"] == 0
+    assert d["volume"] == pytest.approx(400.0)
+    p2, f2, notes = repair.repair(p, f, TOL)
+    assert notes == [] and f2 is f
+
+
+def test_sat_basic_cases():
+    A = np.array([[[0, 0, 0], [1, 0, 0], [0, 1, 0]]], float)
+    cross = np.array([[[0.2, 0.2, -1], [0.2, 0.2, 1], [0.3, 0.25, 0]]], float)   # pierces A
+    apart = A + [0, 0, 1]
+    coplanar = A + [0.2, 0.2, 0]                                                # overlaps in-plane
+    touching = np.array([[[1, 0, 0], [2, 0, 0], [1, 1, 0]]], float)             # one shared point
+    assert repair._tri_tri_sat(A, cross, 1e-9)[0]
+    assert not repair._tri_tri_sat(A, apart, 1e-9)[0]
+    assert repair._tri_tri_sat(A, coplanar, 1e-9)[0]
+    assert not repair._tri_tri_sat(A, touching, 1e-9)[0]
+
+
+def test_folded_flap_self_intersection_repaired():
+    # push one interior top vertex down through the 1 mm thick plate: its fan of
+    # triangles pierces the bottom face
+    p, f = grid_box()
+    top = np.flatnonzero((np.abs(p[:, 2] - 1) < 1e-9) & (np.abs(p[:, 0] - 10) < 1e-9)
+                         & (np.abs(p[:, 1] - 10) < 1e-9))[0]
+    p = p.copy()
+    p[top, 2] = -0.5
+    d = repair.diagnose(p, f, TOL)
+    assert d["closed_manifold"] and d["self_intersections"] > 0
+    p2, f2, notes = repair.repair(p, f, TOL)
+    d2 = repair.diagnose(p2, f2, TOL)
+    assert d2["closed_manifold"] and d2["self_intersections"] == 0, notes
+    assert d2["volume"] == pytest.approx(400.0, rel=1e-6)
+    assert any("self-intersections" in n for n in notes)
+    assert_solid(p2, f2, 400.0)
+
+
+def test_overlapping_separate_shells_untouched():
+    p, f = merge(box((0, 0, 0), 2.0), box((1, 1, 1), 2.0))
+    d = repair.diagnose(p, f, TOL)
+    assert d["self_intersections"] == 0       # crossings between shells don't count
+    p2, f2, notes = repair.repair(p, f, TOL)
+    assert notes == [] and f2 is f and p2 is p
+
+
+def test_large_self_intersection_left_with_warning():
+    # the whole inside of the top face pushed through the bottom: far more than 1% of
+    # the shell, so it is reported, not cut out
+    p, f = grid_box((4.0, 4.0, 1.0), 1.0)
+    p = p.copy()
+    inner = (np.abs(p[:, 2] - 1) < 1e-9) & (p[:, 0] > 0.5) & (p[:, 0] < 3.5) \
+        & (p[:, 1] > 0.5) & (p[:, 1] < 3.5)
+    p[inner, 2] = -0.5
+    assert repair.diagnose(p, f, TOL)["self_intersections"] > 0
+    p2, f2, notes = repair.repair(p, f, TOL)
+    assert any("WARNING" in n and "self-intersect" in n for n in notes)
+    assert f2 is f                            # nothing changed, only reported
