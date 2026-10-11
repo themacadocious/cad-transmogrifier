@@ -86,6 +86,18 @@ UNIT_ANGLE_DEG = 0.02
 MIN_SPAN_DOUBLE_DEG = 40.0
 # a sphere seed triple needs this many more facets around it on the same sphere
 MIN_SPHERE_SUPPORT = 3
+# Facet normal directions closer than MIN_DIR_SEP_DEG count as one (coplanar facets agree
+# to ~1e-4 deg; genuine tessellation steps in the 65-mesh survey are >= 1 deg). A curved
+# region needs at least MIN_FACET_DIRS of them: one direction is a flat patch. (Two -- a
+# 2-facet arc -- are only taken for a fillet when a neighbour continues it tangentially,
+# see _CylModel._tangent_neighbour.)
+MIN_FACET_DIRS = 2
+MIN_DIR_SEP_DEG = 0.5
+# Misfit rejection (_Seg.reject_misfits): facet-centre deviation from the fitted surface
+MISFIT_UNIT_RATIO = 4.0   # one facet vs the region's median facet (cylinders, cones)
+MISFIT_PART_RATIO = 20.0  # region vs the part's typical curved region
+MISFIT_MIN = 0.1          # mm, and at least this
+MISFIT_ABS = 0.25         # mm, when there is nothing to compare with
 # Polygonal prism vs coarse cylinder (reject_polygon_prisms). From a survey of 233
 # full-turn cylinders in 65 real-world STLs (Fusion / Onshape / slicer exports): the
 # coarsest had 20 facets per turn (18 degree steps) and the largest sagitta 0.05 mm;
@@ -615,6 +627,28 @@ class _Model:
         length = np.ptp(h) / max(self.slant_cos(), 1e-6)
         return length < 8 * width
 
+    def unit_devs(self, units):
+        """Per unit: the largest distance of one of its triangles' centres from the
+        surface (~2/3 of that facet's sagitta)."""
+        s = self.s
+        tris = s.tri_order[_ranges(s.tptr, units)[0]]
+        own = np.repeat(np.arange(len(units)), s.ntri[units])
+        dev = np.zeros(len(units))
+        np.maximum.at(dev, own, np.abs(self.residual(s.P[tris].mean(1))))
+        return dev
+
+    def uneven_facets(self, units):
+        """A tessellator steps evenly around an arc, so in a region of 3+ facets one facet
+        cutting in over MISFIT_UNIT_RATIO x as deep as the median facet, and by more than
+        MISFIT_MIN mm, is a flat face whose corners happen to lie on the surface -- e.g. a
+        wide face flanked by two equal narrow chamfers (every isosceles trapezoid profile
+        has its four corners on a circle). (Thin facets along the tangent edges of a real
+        fillet are uneven too, but cut in by hundredths of a mm, not tenths.)"""
+        if len(units) < 3:
+            return False
+        dev = self.unit_devs(units)
+        return bool(dev.max() > max(MISFIT_UNIT_RATIO * np.median(dev), MISFIT_MIN))
+
     def gen_dir(self, X):
         return np.broadcast_to(self.a, X.shape)
 
@@ -746,7 +780,7 @@ class _CylModel(_Model):
         if _span(self.azimuth(X)) < s.min_span:
             return False
         span = _span(self.azimuth(X))
-        nd = _n_dirs(np.arctan2(s.un[units] @ self.e2, s.un[units] @ self.e1), np.radians(0.5))
+        nd = _n_dirs(np.arctan2(s.un[units] @ self.e2, s.un[units] @ self.e1), np.radians(MIN_DIR_SEP_DEG))
         if nd < 2 or (nd == 2 and not self._tangent_neighbour(units)):
             return False
         return not self.doubly_curved_band(units, X, nd, span)
@@ -1567,6 +1601,11 @@ class _Seg:
             self.blocked[region] = True
             self.deferred_regions.append((model, region))
             return False
+        if model.uneven_facets(region):
+            # checked here, after the smooth-ends test: a band of a torus / sphere has
+            # uneven facets too and must still lead to that surface (doubly_from)
+            self.noseed[region] = True
+            return False
         self.accept(model, region)
         return True
 
@@ -1574,7 +1613,7 @@ class _Seg:
         """Set-aside cylinder / cone regions that no torus or sphere claimed are accepted
         as found (their units never overlap: they were blocked for later growth)."""
         for model, region in self.deferred_regions:
-            if (self.label[region] < 0).all():
+            if (self.label[region] < 0).all() and not model.uneven_facets(region):
                 self.accept(model, region)
 
     def doubly_from(self, region):
@@ -2105,6 +2144,59 @@ class _Seg:
         dev = np.abs(mdl.residual(self.ucen[units]))
         return 1.5 * float(np.median(dev)), None, False
 
+    def reject_misfits(self):
+        """Drop curved regions whose facets cut far inside the fitted surface although
+        their vertices lie on it: polyhedral geometry that happens to have its corners on
+        a cylinder (a wide face flanked by two equal narrow chamfers -- any isosceles
+        trapezoid profile is 'cyclic' -- those are already refused at growth time, see
+        _Model.uneven_facets), or a gross fit. The deviation of a facet's centre from
+        the surface is ~2/3 of its sagitta.
+          * any curved region: deviation over MISFIT_PART_RATIO x the part's typical one
+            (triangle-weighted median over its curved regions) and over MISFIT_MIN mm;
+          * with fewer than 3 curved regions to compare, deviation over MISFIT_ABS mm.
+        Full-turn cylinders are left to reject_polygon_prisms (and min_cyl_facets).
+        (Exporters often limit the facet angle as well as the sagitta, so big radii get
+        bigger sagittas: the part-relative limit is deliberately loose.)"""
+        cen = self.P.mean(1)
+        info = {}
+        for l, kind in enumerate(self.kinds):
+            if kind == "plane":
+                continue
+            units = np.nonzero(self.label == l)[0]
+            tris = self.tri_order[_ranges(self.tptr, units)[0]]
+            own = np.repeat(np.arange(len(units)), self.ntri[units])
+            dev = np.zeros(len(units))
+            np.maximum.at(dev, own, np.abs(self.models[l].residual(cen[tris])))
+            info[l] = (kind, dev, len(tris))
+        if not info:
+            return
+        devmax = np.array([v[1].max() for v in info.values()])
+        w = np.array([v[2] for v in info.values()], float)
+        o = np.argsort(devmax)
+        cw = np.cumsum(w[o])
+        typ = float(devmax[o][np.searchsorted(cw, cw[-1] / 2)])
+        drop = []
+        for (l, (kind, dev, ntri)), dmax in zip(info.items(), devmax):
+            if kind == "cyl" and self.region_sagitta(l)[2]:
+                continue   # a full turn: polygonal prism or not is reject_polygon_prisms' call
+            if len(info) >= 3:
+                if dmax > MISFIT_PART_RATIO * typ and dmax > MISFIT_MIN:
+                    drop.append(l)
+            elif dmax > MISFIT_ABS:
+                drop.append(l)
+        self._drop_surfaces(drop)
+
+    def _drop_surfaces(self, drop):
+        if not drop:
+            return
+        keep = [l for l in range(len(self.surfaces)) if l not in drop]
+        remap = np.full(len(self.surfaces) + 1, -1, np.int64)
+        remap[keep] = np.arange(len(keep))
+        self.label = remap[self.label]          # -1 stays -1 (last entry)
+        self.surfaces = [self.surfaces[l] for l in keep]
+        self.kinds = [self.kinds[l] for l in keep]
+        self.models = [self.models[l] for l in keep]
+
     def reject_polygon_prisms(self, min_facets=None):
         """A regular polygonal prism (octagon, 10-, 12-gon) fits a cylinder exactly; only
         the tessellation density tells it from a coarsely exported hole or boss.
@@ -2141,15 +2233,7 @@ class _Seg:
                         drop.append(l)
                 elif sag > POLY_ABS_SAG and facets[l] < POLY_ABS_FACETS + 0.5:
                     drop.append(l)
-        if not drop:
-            return
-        keep = [l for l in range(len(self.surfaces)) if l not in drop]
-        remap = np.full(len(self.surfaces) + 1, -1, np.int64)
-        remap[keep] = np.arange(len(keep))
-        self.label = remap[self.label]          # -1 stays -1 (last entry)
-        self.surfaces = [self.surfaces[l] for l in keep]
-        self.kinds = [self.kinds[l] for l in keep]
-        self.models = [self.models[l] for l in keep]
+        self._drop_surfaces(drop)
 
     def _same(self, A, B):
         ang = np.radians(0.5)
@@ -2243,6 +2327,44 @@ def _surf_residual(sf, X):
     h = v @ sf.axis
     rho = np.linalg.norm(v - np.outer(h, sf.axis), axis=1)
     return np.hypot(rho - sf.major, h) - sf.minor
+
+
+def _n_normal_dirs(nrm, sep_deg, enough):
+    """Number of distinct directions among unit normals (greedy clusters of radius
+    sep_deg), counting no further than `enough`."""
+    cos_sep = np.cos(np.radians(sep_deg))
+    reps = np.zeros((0, 3))
+    left = nrm
+    while len(left) and len(reps) < enough:
+        reps = np.vstack((reps, left[:1]))
+        left = left[(left @ reps[-1]) < cos_sep]
+    return len(reps)
+
+
+def _flatten_bent_pairs(P, tn, labels, surfaces, tol):
+    """After boundary refinement a curved region can be left with facets in fewer than
+    MIN_FACET_DIRS directions (the rest went to the planes they really belong to). That
+    is no longer a curved surface: it becomes a plane if its facets are coplanar within
+    tol, otherwise its triangles stay facets (label -1). Surface indices are kept."""
+    labels = labels.copy()
+    for l, sf in enumerate(surfaces):
+        if isinstance(sf, Plane):
+            continue
+        tris = np.nonzero(labels == l)[0]
+        if len(tris) and _n_normal_dirs(tn[tris], MIN_DIR_SEP_DEG, MIN_FACET_DIRS) >= MIN_FACET_DIRS:
+            continue
+        if len(tris) == 0:
+            continue
+        X = P[tris].reshape(-1, 3)
+        nrm = tn[tris].mean(0)
+        nrm /= np.linalg.norm(nrm)
+        org = X.mean(0)
+        d = (X - org) @ nrm
+        if np.ptp(d) <= 2 * tol:
+            surfaces[l] = Plane(org + nrm * (d.max() + d.min()) / 2, nrm)
+        else:
+            labels[tris] = -1
+    return labels
 
 
 def _refine_boundaries(P, nbr, labels, surfaces, rounds=3):
@@ -2346,6 +2468,8 @@ def segment(points: np.ndarray, faces: np.ndarray, tol: float, angle_deg: float 
             s.cones(only=s.deferred & (s.label < 0))
     s.merge()
     s.reject_polygon_prisms(min_cyl_facets)
+    s.reject_misfits()
     labels = s.planes()
     labels = _refine_boundaries(s.P, s.nbr, labels, s.surfaces)
+    labels = _flatten_bent_pairs(s.P, s.tn, labels, s.surfaces, s.tol)
     return labels, s.surfaces
