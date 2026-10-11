@@ -52,10 +52,12 @@ have put real time and care into this problem, and their projects deserve the cr
   gives a faceted solid with coplanar faces merged, and the Reverse Engineering workbench
   fits surfaces interactively.
 
-What this one adds to that list, for what it's worth: it is open source (LGPL), installs
-with pip, rebuilds cones/spheres/tori as true analytic surfaces, reads slicer 3MF files
-(PrusaSlicer, Bambu Studio, Orca), and repairs broken meshes first. How the tools compare on
-the same files is in [`docs/similar-projects.md`](docs/similar-projects.md).
+What this one brings, for what it's worth: it is open source (LGPL), installs with pip,
+rebuilds cones, spheres and tori as well as planes and cylinders, reads slicer 3MF files
+(PrusaSlicer, Bambu Studio, Orca), and repairs broken meshes first. Each project is
+stronger at different things — BlinkingSun's TrueForm recovered tiny fillets this one
+missed, and The-Dorkknight's fits freeform NURBS where this one leaves facets. The same eight
+files run through all three are in [`docs/similar-projects.md`](docs/similar-projects.md).
 
 ## Made with AI — vibe-coded with Claude
 
@@ -151,6 +153,12 @@ with per-triangle labels) — see `tests/README.md`.
 - `GeomAPI_IntSS` returns trimmed curves; trim/reverse their `BasisCurve()` instead.
 
 ## Known limitations
+- **No freeform fitting**: organic areas (sculpted shapes, thread flanks) stay as flat
+  facets; there is no NURBS fitting. The-Dorkknight/stl2step does this.
+- **Very small fillets** (e.g. 0.6 mm rounds on a case) can stay faceted where
+  BlinkingSun's TrueForm recovers them as cylinders.
+- **No deviation report**: the output's volume is checked against the mesh, but the tool
+  doesn't print a mesh-to-solid deviation figure.
 - **Speed on big freeform meshes**: ~15 s for a 30k-triangle mostly-organic part and
   ~1 min for an 80k-triangle one (segmentation tries cylinders on spline extrusions
   that look locally cylindrical; OCCT then builds and writes tens of thousands of facet
