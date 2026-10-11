@@ -60,10 +60,10 @@ with per-triangle labels) — see `tests/README.md`.
 - `GeomAPI_IntSS` returns trimmed curves; trim/reverse their `BasisCurve()` instead.
 
 ## Known limitations
-- **Speed on big freeform meshes**: a 30k-triangle part with mostly organic/threaded
-  surface takes ~20 s (most of it building and writing ~12k facet faces in OCCT);
-  some freeform meshes (78k triangles) still spend ~50 s in segmentation on failed
-  cylinder attempts. Prismatic/CAD-like parts are fast (corpus: 3 s for 22 files).
+- **Speed on big freeform meshes**: ~15 s for a 30k-triangle mostly-organic part and
+  ~1 min for an 80k-triangle one (segmentation tries cylinders on spline extrusions
+  that look locally cylindrical; OCCT then builds and writes tens of thousands of facet
+  faces). Prismatic/CAD-like parts are fast (corpus: 3 s for 22 files).
 - **Large sphere patches** (hemisphere domes) come back as a few sphere pieces rather
   than one face — exact geometry, just split.
 - **Lossy or mixed-precision exports** can still pick up a few loose stray spheres/tori

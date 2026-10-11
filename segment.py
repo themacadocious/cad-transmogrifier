@@ -172,13 +172,40 @@ def _n_dirs(theta, gap):
     return max(k, 1)
 
 
+def _solve3(A, b):
+    """Solution of the symmetric 3x3 system A x = b by cofactors in plain floats (called
+    a few hundred thousand times on freeform meshes, where numpy's per-call overhead
+    dominates); None if (nearly) singular."""
+    a00, a01, a02 = float(A[0][0]), float(A[0][1]), float(A[0][2])
+    a11, a12, a22 = float(A[1][1]), float(A[1][2]), float(A[2][2])
+    b0, b1, b2 = float(b[0]), float(b[1]), float(b[2])
+    c00 = a11 * a22 - a12 * a12
+    c01 = a02 * a12 - a01 * a22
+    c02 = a01 * a12 - a02 * a11
+    det = a00 * c00 + a01 * c01 + a02 * c02
+    scale = max(abs(a00), abs(a11), abs(a22), 1e-300) ** 3
+    if not abs(det) > 1e-14 * scale:
+        return None
+    c11 = a00 * a22 - a02 * a02
+    c12 = a01 * a02 - a00 * a12
+    c22 = a00 * a11 - a01 * a01
+    x = np.array([c00 * b0 + c01 * b1 + c02 * b2,
+                  c01 * b0 + c11 * b1 + c12 * b2,
+                  c02 * b0 + c12 * b1 + c22 * b2]) / det
+    return x if np.all(np.isfinite(x)) else None
+
+
 def _circle_fit(xy):
     """Algebraic (Kasa) circle fit followed by a few geometric Gauss-Newton steps."""
     m = xy.mean(0)
     q = xy - m
-    A = np.column_stack((q, np.ones(len(q))))
-    b = -(q * q).sum(1)
-    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    n = len(q)
+    x, y = q[:, 0], q[:, 1]
+    M = np.empty((3, n))
+    M[0], M[1], M[2] = x, y, 1.0
+    sol = _solve3(M @ M.T, -(M @ (x * x + y * y)))
+    if sol is None:
+        sol, *_ = np.linalg.lstsq(M.T, -(x * x + y * y), rcond=None)
     c = -sol[:2] / 2
     r2 = c @ c - sol[2]
     if not np.isfinite(r2) or r2 <= 0:
@@ -186,28 +213,35 @@ def _circle_fit(xy):
     r = np.sqrt(r2)
     for _ in range(3):
         d = q - c
-        rho = np.linalg.norm(d, axis=1)
+        rho = np.sqrt(np.einsum("ij,ij->i", d, d))
         if np.any(rho < 1e-12):
             break
-        J = np.column_stack((-d / rho[:, None], -np.ones(len(q))))
-        res = rho - r
-        step, *_ = np.linalg.lstsq(J, -res, rcond=None)
+        # J = -[u_x, u_y, 1]: solve J^T J s = -J^T res
+        M[0], M[1] = d[:, 0] / rho, d[:, 1] / rho
+        step = _solve3(M @ M.T, M @ (rho - r))
+        if step is None:
+            step, *_ = np.linalg.lstsq(-M.T, -(rho - r), rcond=None)
         c = c + step[:2]
         r = r + step[2]
+        if abs(step[0]) + abs(step[1]) + abs(step[2]) <= 1e-13 * abs(r):
+            break   # converged to rounding
     if not np.isfinite(r) or r <= 0:
         return None
     return c + m, float(r)
 
 
-def _lm(resfun, nparam, iters=10, jac=None):
+def _lm(resfun, nparam, iters=10, jac=None, done=0.0):
     """Tiny Levenberg-Marquardt on a residual function of a parameter offset vector.
-    `jac(x)` gives the Jacobian analytically; without it, forward differences."""
+    `jac(x)` gives the Jacobian analytically; without it, forward differences. Stops
+    once the squared residual sum is <= `done`."""
     x = np.zeros(nparam)
     r = resfun(x)
     cost = r @ r
     lam = 1e-6
     h = 1e-7
     for _ in range(iters):
+        if cost <= done:
+            break
         if jac is not None:
             J = jac(x)
         else:
@@ -637,36 +671,70 @@ class _CylModel(_Model):
         return True
 
     def _polish(self, X):
+        """Levenberg-Marquardt over (axis tilt 2, centre shift 2, radius), same steps as
+        _lm, with residual and Jacobian computed together (this runs tens of thousands
+        of times on freeform meshes, on a handful of points each time)."""
         a0, c0, R0 = self.a, self.c, self.R
         e1, e2 = self.e1, self.e2
+        E = np.array([e1, e2])
+        n = len(X)
 
-        def res(x):
-            a = _unit(a0 + x[0] * e1 + x[1] * e2)
-            c = c0 + x[2] * e1 + x[3] * e2
-            v = X - c
-            r = v - np.outer(v @ a, a)
-            return np.linalg.norm(r, axis=1) - (R0 + x[4])
-
-        def jac(x):
+        def ev(x):
             q = a0 + x[0] * e1 + x[1] * e2
             nq = np.sqrt(q @ q)
             a = q / nq
             v = X - (c0 + x[2] * e1 + x[3] * e2)
             h = v @ a
-            w = v - np.outer(h, a)
-            wh = w / np.maximum(np.linalg.norm(w, axis=1), 1e-300)[:, None]
-            J = np.empty((len(X), 5))
-            for k, e in enumerate((e1, e2)):
-                J[:, k] = -h * (wh @ ((e - (e @ a) * a) / nq))
-                J[:, 2 + k] = -(wh @ e)
+            w = v - h[:, None] * a
+            rho = np.sqrt(np.einsum("ij,ij->i", w, w))
+            return rho - (R0 + x[4]), (a, nq, h, w, rho)
+
+        def jac(st):
+            a, nq, h, w, rho = st
+            wh = w / np.maximum(rho, 1e-300)[:, None]
+            J = np.empty((n, 5))
+            D = (E - np.outer(E @ a, a)) / nq
+            J[:, :2] = -h[:, None] * (wh @ D.T)
+            J[:, 2:4] = -(wh @ E.T)
             J[:, 4] = -1.0
             return J
 
-        x = _lm(res, 5, jac=jac)
+        x = np.zeros(5)
+        r, st = ev(x)
+        r0max = np.abs(r).max()
+        cost = r @ r
+        # residuals a millionth of tol are as good as zero: few-point fits (most of the
+        # calls) otherwise iterate on down to rounding noise
+        done = n * (1e-6 * self.s.tol) ** 2
+        lam = 1e-6
+        for _ in range(10):
+            if cost <= done:
+                break
+            J = jac(st)
+            JtJ = J.T @ J
+            g = J.T @ r
+            dJ = np.diag(np.diag(JtJ) + 1e-12)
+            improved = False
+            step = np.zeros(5)
+            for _ in range(6):
+                try:
+                    step = -np.linalg.solve(JtJ + lam * dJ, g)
+                except np.linalg.LinAlgError:
+                    lam *= 10
+                    continue
+                rn, stn = ev(x + step)
+                cn = rn @ rn
+                if np.isfinite(cn) and cn < cost:
+                    improved = cn < cost * (1 - 1e-6)
+                    x, r, st, cost = x + step, rn, stn, cn
+                    lam = max(lam / 10, 1e-9)
+                    break
+                lam *= 10
+            if not improved or np.sqrt(step @ step) < 1e-12:
+                break
         a = _unit(a0 + x[0] * e1 + x[1] * e2)
         c = c0 + x[2] * e1 + x[3] * e2
-        before = np.abs(res(np.zeros(5))).max()
-        if np.abs(res(x)).max() <= max(before, self.s.tol):
+        if np.abs(r).max() <= max(r0max, self.s.tol):
             c = c - (c - c0) @ a * a  # keep the origin near the region centre
             self.set(a, c, R0 + x[4])
 
@@ -805,7 +873,7 @@ class _ConeModel(_Model):
             J[:, 5] = -rho * sa - h * ca
             return J
 
-        x = _lm(res, 6, jac=jac)
+        x = _lm(res, 6, jac=jac, done=len(X) * (1e-6 * self.s.tol) ** 2)
         before = np.abs(res(np.zeros(6))).max()
         if np.abs(res(x)).max() <= max(before, self.s.tol) and 0 < al0 + x[5] < np.pi / 2:
             self.set(c0 + x[2] * e1 + x[3] * e2 + x[4] * a0, a0 + x[0] * e1 + x[1] * e2, al0 + x[5])
@@ -910,7 +978,7 @@ class _SphereModel(_Model):
                 J[:, 3] = -1.0
                 return J
 
-            x = _lm(res, 4, jac=jac)
+            x = _lm(res, 4, jac=jac, done=len(X) * (1e-6 * s.tol) ** 2)
             if np.abs(res(x)).max() <= max(np.abs(res(np.zeros(4))).max(), s.tol):
                 self.set(c0 + x[:3], R0 + x[3])
         nrm, w = s.un[units], s.uarea[units]
@@ -1054,7 +1122,10 @@ class _TorusModel(_Model):
         cost0 = cost = f @ f
         start = np.abs(f).max()
         lam = 1e-6
+        done_cost = len(X) * (1e-6 * self.s.tol) ** 2   # as good as exact
         for _ in range(iters):
+            if cost <= done_cost:
+                break
             e1, e2 = _basis(a)
             rho_s = np.maximum(rho, 1e-300)
             D_s = np.maximum(D, 1e-300)
@@ -1269,6 +1340,31 @@ class _Seg:
         found = self._pe_key[i] == key
         return np.where(found[:, None], self._pe_dir[i], 0.0)
 
+    def _first_ok_per_unit(self, u, check, n=2):
+        """Indices of the first n rows per distinct u (rows sorted by u) for which
+        check(rows) is True -- the same rows as filtering everything with check and then
+        taking _first_per_unit, but check only runs on rows that could be chosen."""
+        m = len(u)
+        if m == 0:
+            return np.zeros(0, np.int64)
+        first = np.concatenate(([True], u[1:] != u[:-1]))
+        grp = np.cumsum(first) - 1
+        gstart = np.nonzero(first)[0]
+        done = np.zeros(m, bool)
+        good = np.zeros(m, bool)
+        while True:
+            have = np.bincount(grp[good], minlength=len(gstart))
+            todo = ~done
+            # position of each unchecked row among its group's unchecked rows (1-based)
+            c = np.cumsum(todo)
+            c = c - np.concatenate(([0], c))[gstart][grp]
+            pick = np.nonzero(todo & (c <= n - have[grp]))[0]
+            if len(pick) == 0:
+                break
+            good[pick] = check(pick)
+            done[pick] = True
+        return np.nonzero(good)[0][self._first_per_unit(u[good], n)]
+
     def _first_per_unit(self, u, n=2):
         """Indices of the first n rows for each distinct u (rows sorted by u)."""
         if len(u) == 0:
@@ -1328,6 +1424,8 @@ class _Seg:
                 if not model.fit(np.array(region), polish=model.kind == "cone" or (model.kind == "cyl" and len(region) < 12)):
                     model.__dict__.update(saved)
                 grown_at_fit = len(region)
+                if model.kind == "cone" and len(region) >= 50 and model.alpha < 0.5 * s.min_cone:
+                    break   # it is a cylinder: no cone (alpha > min_cone) will come of it
         return np.array(sorted(region))
 
     def _component(self, model, seed_units):
@@ -1344,8 +1442,25 @@ class _Seg:
         comp = connected_components(g, directed=False)[1]
         return nodes[comp == comp[idx[seed_units[0]]]]
 
+    def _cyl_dead_end(self, init):
+        """Cheap look-ahead for a cylinder start: fitted the way growth refits (axis from
+        the facet normals, polished), the start covers less than the minimum arc and not
+        one free neighbour of it lies on that cylinder -- so growth would stall at once
+        and quick_ok fail. On threads, organic and patterned meshes that is nearly every
+        start, and the look-ahead costs a fraction of the fit / grow / refit / stall
+        cycle. (Checked against all 65 survey meshes: no cylinder is lost.)"""
+        ring = _uniq(self.uadj_idx[_ranges(self.uadj_ptr, init)[0]])
+        ring = ring[(self.label[ring] < 0) & ~self.blocked[ring] & ~np.isin(ring, init)]
+        m = _CylModel(self)
+        if not m.fit(init, polish=True):
+            return False
+        X, _ = m.unit_points(init)
+        return not (_span(m.azimuth(X)) >= self.min_span * 0.8 or (len(ring) and m.test(ring).any()))
+
     def try_region(self, model, seed, init_units, fit_kw):
         """Initial fit on init_units, grow, polish, re-grow fixed. Region or None."""
+        if model.kind == "cyl" and self._cyl_dead_end(np.asarray(init_units)):
+            return None
         if not model.fit(np.asarray(init_units), **fit_kw):
             return None
         if model.kind == "cyl" and model.R > self.max_radius:
@@ -1361,6 +1476,8 @@ class _Seg:
         self.hopeless = True   # failing before the polish: the patch can't be this surface
         if len(region) < 2:
             return None
+        if model.kind == "cone" and model.alpha < 0.5 * self.min_cone:
+            return None   # a cylinder (or a patch of one), see grow
         if not model.quick_ok(region):
             if (model.kind in ("cyl", "cone") and len(region) >= 6 and self.label[region].max() < 0
                     and model.smooth_ends(region)[0] >= 0.5):
@@ -1369,6 +1486,13 @@ class _Seg:
                 self.doubly_from(region)
             return None
         self.hopeless = False
+        if model.kind == "cyl":
+            # the polished re-grow uses a narrower band, so it does not widen the arc:
+            # short of min_span now, valid() will reject it (in a survey of 65 real
+            # meshes no accepted cylinder ever had less arc at this point)
+            X, _ = model.unit_points(region)
+            if _span(model.azimuth(X)) < self.min_span:
+                return None
         if model.kind in ("cyl", "cone"):
             model.limit_width(region)
             if not model.test(seedarr).all():
@@ -1492,15 +1616,15 @@ class _Seg:
         agree = np.abs(dot) >= np.cos(np.radians(2.0))
         u, v, w = u[agree], v[agree], w[agree]
         ax = ax1[agree] + ax2[agree] * np.sign(dot[agree])[:, None]
-        ok = self._circle_triples(u, v, w, ax)
-        u, v, w, ax = u[ok], v[ok], w[ok], ax[ok]
         # prefer triples whose shared edges run along the axis (facet strips of a
         # tessellated cylinder share generator lines; a row of a sphere/torus does not)
         along = (np.abs(np.einsum("ij,ij->i", self._pair_edge_dir(u, v), ax / np.linalg.norm(ax, axis=1)[:, None])) > 0.99) \
             & (np.abs(np.einsum("ij,ij->i", self._pair_edge_dir(u, w), ax / np.linalg.norm(ax, axis=1)[:, None])) > 0.99)
         o = np.lexsort((np.arange(len(u)), ~along, u))
         u, v, w, ax = u[o], v[o], w[o], ax[o]
-        sel = self._first_per_unit(u, 2)
+        # the first two triples per seed that lie on a circle (checked lazily: the check
+        # is costly with big flat units and most seeds have dozens of candidate triples)
+        sel = self._first_ok_per_unit(u, lambda i: self._circle_triples(u[i], v[i], w[i], ax[i]), 2)
         u, v, w, ax = u[sel], v[sel], w[sel], ax[sel]
         noseed = self.noseed
         # biggest facets first: deterministic and tends to start in the middle of strips
@@ -1525,9 +1649,34 @@ class _Seg:
                     noseed[self.last_grown] = True
                     break
 
+    def _unit_moments(self):
+        """Per unit: vertex count, centroid, and 2nd / 3rd central moments of its vertices
+        (enough to set up an algebraic circle fit of any group of units in any plane)."""
+        if hasattr(self, "_um"):
+            return self._um
+        U = self.U
+        own = np.repeat(np.arange(U), np.diff(self.vptr))
+        X = self.points[self.vidx]
+        cnt = np.bincount(own, minlength=U).astype(float)
+        cen = np.stack([np.bincount(own, X[:, k], U) for k in range(3)], 1) / np.maximum(cnt, 1)[:, None]
+        d = X - cen[own]
+        M2 = np.empty((U, 3, 3))
+        M3 = np.empty((U, 3, 3, 3))
+        for i in range(3):
+            for j in range(i, 3):
+                M2[:, i, j] = M2[:, j, i] = np.bincount(own, d[:, i] * d[:, j], U)
+                for k in range(j, 3):
+                    val = np.bincount(own, d[:, i] * d[:, j] * d[:, k], U)
+                    for p in {(i, j, k), (i, k, j), (j, i, k), (j, k, i), (k, i, j), (k, j, i)}:
+                        M3[(slice(None),) + p] = val
+        self._um = (cnt, cen, M2, M3)
+        return self._um
+
     def _circle_triples(self, u, v, w, ax):
         """Vectorised check that the vertices of each triple lie on one circle around `ax`
-        (algebraic circle fit in the plane perpendicular to the axis)."""
+        (algebraic circle fit in the plane perpendicular to the axis). The fit comes from
+        per-unit moments; the residual check goes unit by unit, small units first, and
+        only on triples still alive, so big flat units are rarely touched vertex by vertex."""
         n = len(u)
         if n == 0:
             return np.zeros(0, bool)
@@ -1536,37 +1685,53 @@ class _Seg:
         e1 = np.cross(ax, h)
         e1 /= np.linalg.norm(e1, axis=1)[:, None]
         e2 = np.cross(ax, e1)
-        Xs, owners = [], []
-        for x in (u, v, w):
-            pos, lens = _ranges(self.vptr, x)
-            Xs.append(self.points[self.vidx[pos]])
-            owners.append(np.repeat(np.arange(n), lens))
-        X, own = np.concatenate(Xs), np.concatenate(owners)
-        cnt = np.bincount(own, minlength=n).astype(float)
-        mean = np.stack([np.bincount(own, X[:, k], n) for k in range(3)], 1) / cnt[:, None]
-        Q = X - mean[own]
-        x = np.einsum("ij,ij->i", Q, e1[own])
-        y = np.einsum("ij,ij->i", Q, e2[own])
-        z = x * x + y * y
-        cols = (x, y, np.ones_like(x))
-        A = np.empty((n, 3, 3))
-        b = np.empty((n, 3))
-        for i in range(3):
-            b[:, i] = -np.bincount(own, cols[i] * z, n)
-            for j in range(i, 3):
-                A[:, i, j] = A[:, j, i] = np.bincount(own, cols[i] * cols[j], n)
+        E = np.stack((e1, e2), 1)                                  # (n, 2, 3)
+        cnt, cen, M2, M3 = self._unit_moments()
+        tri = np.stack((u, v, w), 1)
+        nk = cnt[tri]                                              # (n, 3)
+        N = nk.sum(1)
+        mean = np.einsum("nk,nkj->nj", nk, cen[tri]) / N[:, None]
+        S2 = np.zeros((n, 3, 3))
+        S3 = np.zeros((n, 3, 3, 3))
+        for k in range(3):
+            dl = cen[tri[:, k]] - mean                             # shift to the triple mean
+            m2 = M2[tri[:, k]]
+            S2 += m2 + nk[:, k, None, None] * np.einsum("ni,nj->nij", dl, dl)
+            S3 += (M3[tri[:, k]] + np.einsum("nij,nk->nijk", m2, dl) + np.einsum("nik,nj->nijk", m2, dl)
+                   + np.einsum("njk,ni->nijk", m2, dl) + nk[:, k, None, None, None] * np.einsum("ni,nj,nk->nijk", dl, dl, dl))
+        P2 = np.einsum("nai,nij,nbj->nab", E, S2, E)               # sums of x x, x y, y y
+        P3 = np.einsum("nai,nbj,nck,nijk->nabc", E, E, E, S3)
+        Szx = P3[:, 0, 0, 0] + P3[:, 1, 1, 0]                      # sum (x^2 + y^2) x
+        Szy = P3[:, 0, 0, 1] + P3[:, 1, 1, 1]
+        Sz = P2[:, 0, 0] + P2[:, 1, 1]
+        A = np.zeros((n, 3, 3))
+        A[:, :2, :2] = P2
+        A[:, 2, 2] = N
+        bvec = -np.stack((Szx, Szy, Sz), 1)
         ok = np.abs(np.linalg.det(A)) > 1e-18
         A[~ok] = np.eye(3)
-        sol = np.linalg.solve(A, b[:, :, None])[:, :, 0]
+        sol = np.linalg.solve(A, bvec[:, :, None])[:, :, 0]
         cx, cy = -sol[:, 0] / 2, -sol[:, 1] / 2
         r2 = cx * cx + cy * cy - sol[:, 2]
         ok &= r2 > 0
         r = np.sqrt(np.maximum(r2, 0))
-        res = np.abs(np.hypot(x - cx[own], y - cy[own]) - r[own])
-        mx = np.zeros(n)
-        np.maximum.at(mx, own, res)
-        # Kasa is slightly biased on short arcs; allow a little slack, the real check follows
-        return ok & (mx <= 2 * self.tol) & (r > 10 * self.tol) & (r < self.max_radius)
+        ok &= (r > 10 * self.tol) & (r < self.max_radius)
+        # residuals, smallest unit of each triple first, survivors only
+        order = np.argsort(nk, axis=1, kind="stable")
+        for col in range(3):
+            live = np.nonzero(ok)[0]
+            if len(live) == 0:
+                break
+            x = tri[live, order[live, col]]
+            pos, lens = _ranges(self.vptr, x)
+            owner = np.repeat(np.arange(len(live)), lens)
+            Q = self.points[self.vidx[pos]] - mean[live][owner]
+            px = np.einsum("ij,ij->i", Q, e1[live][owner])
+            py = np.einsum("ij,ij->i", Q, e2[live][owner])
+            res = np.abs(np.hypot(px - cx[live][owner], py - cy[live][owner]) - r[live][owner])
+            # Kasa is slightly biased on short arcs; allow a little slack, the real check follows
+            ok[live[np.maximum.reduceat(res, _seg_starts(lens)) > 2 * self.tol]] = False
+        return ok
 
     def _cone_triples(self, u, v, w):
         """Vectorised cone through three facet units: apex = intersection of the three facet
@@ -1585,26 +1750,29 @@ class _Seg:
         apex = np.linalg.solve(Nsafe, rhs[:, :, None])[:, :, 0]
         sgn = np.sign(np.einsum("ij,ij->i", self.ucen[u] - apex, ax))
         ax *= np.where(sgn == 0, 1, sgn)[:, None]
-        maxres = np.zeros(len(u))
+        alpha = np.zeros(len(u))
+        # unit by unit (u first: it sets the opening angle), each stage only on the
+        # triples still alive -- big flat units otherwise make this the slowest step
+        live = np.nonzero(ok)[0]
         for x in (u, v, w):
-            pos, lens = _ranges(self.vptr, x)
-            owner = np.repeat(np.arange(len(x)), lens)
-            X = self.points[self.vidx[pos]] - apex[owner]
-            h = np.einsum("ij,ij->i", X, ax[owner])
-            rho = np.linalg.norm(X - h[:, None] * ax[owner], axis=1)
-            ang = np.arctan2(rho, h)
-            # residuals relative to the median opening angle of the triple are checked
-            # after the alpha estimate below; here store h/rho for it
+            if len(live) == 0:
+                break
+            pos, lens = _ranges(self.vptr, x[live])
+            owner = np.repeat(np.arange(len(live)), lens)
+            X = self.points[self.vidx[pos]] - apex[live][owner]
+            axo = ax[live][owner]
+            h = np.einsum("ij,ij->i", X, axo)
+            rho = np.linalg.norm(X - h[:, None] * axo, axis=1)
             if x is u:
-                alpha = np.zeros(len(u))
-                np.maximum.at(alpha, owner, 0)
-                a_sum = np.bincount(owner, ang, len(u)) / np.maximum(lens, 1)
-                alpha = a_sum
-            d = rho * np.cos(alpha[owner]) - h * np.sin(alpha[owner])
+                alpha[live] = np.bincount(owner, np.arctan2(rho, h), len(live)) / np.maximum(lens, 1)
+            al = alpha[live][owner]
+            d = rho * np.cos(al) - h * np.sin(al)
             d = np.where(h >= -self.tol, np.abs(d), np.inf)
-            np.maximum.at(maxres, owner, d)
-        ok &= maxres <= self.tol
-        ok &= (alpha > self.min_cone) & (alpha < self.max_cone)
+            good = np.maximum.reduceat(d, _seg_starts(lens)) <= self.tol
+            if x is u:
+                good &= (alpha[live] > self.min_cone) & (alpha[live] < self.max_cone)
+            ok[live[~good]] = False
+            live = live[good]
         return ok
 
     def spheres(self):
@@ -1614,15 +1782,18 @@ class _Seg:
         u, v, w = u[keep], v[keep], w[keep]
         if len(u) == 0:
             return
-        ok, c, r, mx = self._sphere_triples(u, v, w)
-        u, v, w, c, r, mx = u[ok], v[ok], w[ok], c[ok], r[ok], mx[ok]
-        sup = self._sphere_support(u, v, w, c, r)
-        # a single facet row (a one-fan cap, a strip next to a torus of the same radius)
-        # only has two more facets around any three of its own; take those when the
-        # three sit exactly on the sphere, as a real CAD tessellation does
-        ok = (sup >= MIN_SPHERE_SUPPORT) | ((sup >= 2) & (mx <= 0.05 * self.tol))
-        u, v, w = u[ok], v[ok], w[ok]
-        sel = self._first_per_unit(u, 2)
+        def check(i):
+            ok, c, r, mx = self._sphere_triples(u[i], v[i], w[i])
+            res = np.zeros(len(i), bool)
+            j = np.nonzero(ok)[0]
+            if len(j):
+                sup = self._sphere_support(u[i][j], v[i][j], w[i][j], c[j], r[j])
+                # a single facet row (a one-fan cap, a strip next to a torus of the same
+                # radius) only has two more facets around any three of its own; take
+                # those when the three sit exactly on the sphere, as CAD tessellates
+                res[j] = (sup >= MIN_SPHERE_SUPPORT) | ((sup >= 2) & (mx[j] <= 0.05 * self.tol))
+            return res
+        sel = self._first_ok_per_unit(u, check, 2)
         u, v, w = u[sel], v[sel], w[sel]
         order = np.lexsort((np.arange(len(u)), -self.uarea[u]))
         for i in order.tolist():
@@ -1852,9 +2023,7 @@ class _Seg:
         u, v, w = u[keep], v[keep], w[keep]
         if len(u) == 0:
             return
-        ok = self._cone_triples(u, v, w)
-        u, v, w = u[ok], v[ok], w[ok]
-        sel = self._first_per_unit(u, 2)
+        sel = self._first_ok_per_unit(u, lambda i: self._cone_triples(u[i], v[i], w[i]), 2)
         u, v, w = u[sel], v[sel], w[sel]
         order = np.lexsort((np.arange(len(u)), -self.uarea[u]))
         noseed = self.noseed
