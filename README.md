@@ -68,10 +68,13 @@ with per-triangle labels) — see `tests/README.md`.
   than one face — exact geometry, just split.
 - **Lossy or mixed-precision exports** can still pick up a few loose stray spheres/tori
   on organic areas (on exact CAD exports a tightness rule suppresses them).
-- **Octagonal prisms** read as cylinders when the mesh has no finer curved surface to
-  compare their tessellation against.
+- **Polygonal prisms vs coarse cylinders** are told apart by chordal deviation (a real
+  export's facets hug the curve; an octagon's don't). A lone 8-facet hole of ~3 mm
+  radius is still read as a cylinder. `--min-cyl-facets N` overrides (0 = always
+  cylinder).
 - **Overlapping bodies** are fused with a boolean, which can take a while with many
   faceted bodies; touching-only bodies stay separate solids.
-- **Mesh repair** fixes non-manifold edges, cracks, small holes, winding, slivers and
-  cap triangles, but not self-intersections or needle triangles; it may make tiny
-  edge flips (reported) even on otherwise clean meshes. `--no-repair` skips it.
+- **Mesh repair** fixes non-manifold edges, cracks, small holes, winding, slivers, cap
+  and needle triangles, and small self-intersections; larger self-intersecting areas
+  (e.g. crossing thread flanks) are left in place with a warning. It may make tiny,
+  reported edge flips even on otherwise clean meshes. `--no-repair` skips it.
