@@ -16,12 +16,14 @@ Options:
 - `--angle DEG` — max angle between triangles merged into one flat face (default 0.5)
 - `--no-merge` — one face per triangle
 - `--weld MM` — vertex weld tolerance
+- `--no-repair` — skip mesh repair
 
 Setup: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 
 ## What you get
 
-By default the mesh is **segmented** into planes, cylinders and cones (`segment.py`) and
+By default the mesh is **segmented** into planes, cylinders, cones, spheres and tori
+(`segment.py`) and
 **rebuilt** as true analytic faces (`rebuild.py`): a drilled hole becomes one cylinder you
 can select and resize, a countersink becomes a cone, flat walls become single planes.
 Edges between them are real lines, circles and ellipses (exact surface intersections).
@@ -31,7 +33,10 @@ locally — the rest of the part still gets clean faces. If the rebuild can't pr
 valid closed solid with the mesh's volume, it falls back to the faceted conversion, so
 the result is never worse than `--faceted`.
 
-Non-watertight or non-manifold meshes export as an open surface body with a warning.
+Broken meshes are repaired first (`repair.py`): non-manifold edges, T-junction cracks,
+small holes, inconsistent winding, slivers and cap triangles. Internal voids stay voids;
+bodies that overlap are fused into one solid, bodies that only touch stay separate.
+A mesh that still isn't closed after repair exports as an open surface with a warning.
 
 ## Testing
 
@@ -55,16 +60,18 @@ with per-triangle labels) — see `tests/README.md`.
 - `GeomAPI_IntSS` returns trimmed curves; trim/reverse their `BasisCurve()` instead.
 
 ## Known limitations
-- **Full hemisphere domes** stay faceted: a sphere patch that large always has a pole
-  on or inside it, which needs degenerate-edge handling rebuild.py doesn't do yet.
-  Corner blends (1/8 spheres) are fine.
-- **Speed**: segmentation is ~1.5 ms per 10 triangles on freeform/threaded meshes
-  (30k triangles ≈ 5 s segment + ~25 s rebuild/merge/STEP). Fine meshes of 100k+
-  triangles get slow.
-- **Very finely tessellated tori** (angular step < ~2°) can be misread as stacks of thin
-  cylinders.
-- **Threads and organic shapes** stay facets, and occasionally produce a small
-  accidental sphere/cone that happens to fit within tolerance.
-- **Ambiguous geometry**: an octagonal prism can come out as a cylinder; a shallow flat
-  on a shaft (< ~46°) can be absorbed into the cylinder.
-- Non-manifold / non-watertight meshes skip the rebuild and export as an open surface.
+- **Speed on big freeform meshes**: a 30k-triangle part with mostly organic/threaded
+  surface takes ~20 s (most of it building and writing ~12k facet faces in OCCT);
+  some freeform meshes (78k triangles) still spend ~50 s in segmentation on failed
+  cylinder attempts. Prismatic/CAD-like parts are fast (corpus: 3 s for 22 files).
+- **Large sphere patches** (hemisphere domes) come back as a few sphere pieces rather
+  than one face — exact geometry, just split.
+- **Lossy or mixed-precision exports** can still pick up a few loose stray spheres/tori
+  on organic areas (on exact CAD exports a tightness rule suppresses them).
+- **Octagonal prisms** read as cylinders when the mesh has no finer curved surface to
+  compare their tessellation against.
+- **Overlapping bodies** are fused with a boolean, which can take a while with many
+  faceted bodies; touching-only bodies stay separate solids.
+- **Mesh repair** fixes non-manifold edges, cracks, small holes, winding, slivers and
+  cap triangles, but not self-intersections or needle triangles; it may make tiny
+  edge flips (reported) even on otherwise clean meshes. `--no-repair` skips it.
