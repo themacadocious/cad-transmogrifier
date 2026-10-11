@@ -63,11 +63,13 @@ class RebuildError(Exception):
 
 
 class _ChainError(RebuildError):
-    """An edge between two regions couldn't be built; demote their curved surfaces."""
+    """Something couldn't be built: demote `regions`' curved surfaces, and rebuild the
+    boundaries of `poly` regions as plain polylines (no line simplification)."""
 
-    def __init__(self, msg, regions):
+    def __init__(self, msg, regions, poly=()):
         super().__init__(msg)
         self.regions = regions
+        self.poly = set(poly)
 
 
 def _kind(s):
@@ -332,8 +334,9 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
             surfaces.extend([None] * len(tris))
 
     n_split = len(_split_wrapping(points, faces, labels, surfaces, range(len(surfaces))))
+    poly_regions = set()
     for _ in range(max_rounds):
-        chains, bad = _build_chains(points, faces, labels, surfaces, he, tol)
+        chains, bad = _build_chains(points, faces, labels, surfaces, he, tol, poly_regions)
         if bad:
             demote(bad)
             continue
@@ -342,9 +345,11 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
             break
         except _ChainError as e:
             curved = [r for r in e.regions if _is_curved(surfaces[r])]
-            if not curved:
+            fresh_poly = e.poly - poly_regions
+            if not curved and not fresh_poly:
                 raise
             demote(curved)
+            poly_regions |= fresh_poly
     else:
         raise RebuildError("chain classification did not converge")
 
@@ -485,7 +490,7 @@ def _split_sphere(points, faces, labels, surfaces, r, max_angle=np.radians(70), 
     return True
 
 
-def _build_chains(points, faces, labels, surfaces, he, tol):
+def _build_chains(points, faces, labels, surfaces, he, tol, poly_regions=frozenset()):
     """Group boundary edges into chains and classify them. Returns (chains, regions_to_demote)."""
     # undirected boundary edges keyed by the (sorted) region pair
     pair_edges = defaultdict(list)
@@ -532,6 +537,9 @@ def _build_chains(points, faces, labels, surfaces, he, tol):
         (ra, rb), path = ch
         closed = path[0] == path[-1]
         geom = _chain_geom(points[path], surfaces[ra], surfaces[rb], tol, closed)
+        if geom is not None and geom[0] == "line" and (ra in poly_regions or rb in poly_regions):
+            # a near-collinear chain straightened into a line can collapse a thin face
+            geom = ("poly",)
         if geom is None:
             demote.update(r for r in (ra, rb) if _is_curved(surfaces[r]))
         ch.append(geom)
@@ -650,6 +658,7 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     builder = BRep_Builder()
     shells = {}
     made = []
+    region_body = {}
 
     for r, tris in _region_index(labels).items():
         surf = surfaces[r]
@@ -684,18 +693,38 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
         face = _make_face(surf, wires, points, faces, tris, tol, reshape)
         made.append((r, face))
         b = int(body[tris[0]])
+        region_body[r] = b
         if b not in shells:
             shells[b] = TopoDS_Shell()
             builder.MakeShell(shells[b])
         builder.Add(shells[b], face)
 
+    # inward-wound bodies are internal voids: they go into the solid that contains them
+    # as an extra shell, instead of becoming (negative) solids of their own
+    tet = np.einsum("ij,ij->i", points[faces[:, 0]], np.cross(points[faces[:, 1]], points[faces[:, 2]]))
+    body_vol = {b: float(tet[body == b].sum() / 6) for b in shells}
+    outer = [b for b in shells if body_vol[b] > 0]
+    solid_of = {}
     solids = []
-    for sh in shells.values():
-        sh.Closed(True)
+    for b in outer:
+        shells[b].Closed(True)
         so = TopoDS_Solid()
         builder.MakeSolid(so)
-        builder.Add(so, sh)
+        builder.Add(so, shells[b])
+        solid_of[b] = len(solids)
         solids.append(so)
+    for b in shells:
+        if b in solid_of:
+            continue
+        probe = points[faces[np.nonzero(body == b)[0][0], 0]]
+        holders = [o for o in outer if _point_in_mesh(probe, points[faces[body == o]])]
+        if not holders:
+            raise RebuildError("inward-facing shell that isn't inside any body")
+        # innermost container = the smallest one holding it
+        o = min(holders, key=lambda x: body_vol[x])
+        shells[b].Closed(True)
+        builder.Add(solids[solid_of[o]], shells[b])
+        solid_of[b] = solid_of[o]
     if len(solids) == 1:
         solid = solids[0]
     else:
@@ -711,12 +740,12 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     for (ra, rb), _, _ in chains:
         neighbours[ra].add(rb)
         neighbours[rb].add(ra)
-    blame = set()
+    blame, poly = set(), set()
     curvedish = {r for r, _ in made if _is_curved(surfaces[r])}
     curvedish |= {x for r in curvedish for x in neighbours[r]}
     for r, f in made:
         # only curved faces and their neighbours can be spoiled by this construction;
-        # anything else is caught by the whole-solid check in rebuild()
+        # anything else is caught by the per-body check below
         if r in curvedish and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
             # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
             blame.update({r} if _is_curved(surfaces[r])
@@ -726,7 +755,33 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
 
     final = ShapeFix_Shape(solid)
     final.Perform()
-    return final.Shape()
+    out = final.Shape()
+
+    # a body can come out invalid as a solid even with every face valid (closure,
+    # orientation); demote that body's curved regions rather than lose every body
+    built = []
+    exp = TopExp_Explorer(out, TopAbs_SOLID)
+    while exp.More():
+        built.append(exp.Current())
+        exp.Next()
+    if len(built) == len(solids):
+        bad_solids = {i for i, so in enumerate(built) if not BRepCheck_Analyzer(so).IsValid()}
+        bad_bodies = {b for b, i in solid_of.items() if i in bad_solids}
+        if bad_bodies:
+            # usually a thin planar face whose straightened edges collapsed: find the bad
+            # faces; planes get polyline edges, curved faces (and a bad plane's curved
+            # neighbours) get demoted
+            for r, f in made:
+                if region_body[r] in bad_bodies and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
+                    if _is_curved(surfaces[r]):
+                        blame.add(r)
+                    else:
+                        poly.add(r)
+                        blame.update(x for x in neighbours[r] if _is_curved(surfaces[x]))
+            if not blame and not poly:  # nothing face-level to blame: drop its curves
+                blame = {r for r, b in region_body.items() if b in bad_bodies and _is_curved(surfaces[r])}
+            raise _ChainError(f"{len(bad_bodies)} bodies came out invalid", tuple(blame), poly)
+    return out
 
 
 def _count(shape, kind):
@@ -747,6 +802,23 @@ def count_solid_faces(shape):
         n += _count(exp.Current(), TopAbs_FACE)
         exp.Next()
     return n
+
+
+def _point_in_mesh(p, tris):
+    """Ray-parity test of point p against a closed triangle mesh (T, 3, 3)."""
+    d = np.array([0.5773, 0.5774, 0.5775])  # skewed so the ray avoids edges/vertices
+    e1, e2 = tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0]
+    h = np.cross(d, e2)
+    a = np.einsum("ij,ij->i", e1, h)
+    ok = np.abs(a) > 1e-14
+    f = np.where(ok, 1.0 / np.where(ok, a, 1), 0)
+    s = p - tris[:, 0]
+    u = f * np.einsum("ij,ij->i", s, h)
+    q = np.cross(s, e1)
+    v = f * (q @ d)
+    t = f * np.einsum("ij,ij->i", e2, q)
+    hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 0)
+    return bool(hit.sum() % 2)
 
 
 def _bodies(faces, he):
