@@ -1,10 +1,11 @@
 # stl2step
 
-Converts STL meshes into real B-rep solids (STEP/IGES/BREP) that CAD programs can edit —
+Converts STL and 3MF meshes into real B-rep solids (STEP/IGES/BREP) that CAD programs can edit —
 like Fusion 360's "Mesh to BRep" with the prismatic option, built on OpenCASCADE
 (`cadquery-ocp`).
 
     ./stl2step part.stl                 # -> part.step next to it
+    ./stl2step case.3mf                 # 3MF works too (PrusaSlicer, Bambu Studio, Orca)
     ./stl2step *.stl                    # batch
     ./stl2step part.stl -o part.iges
     ./stl2step                          # GUI with file picker
