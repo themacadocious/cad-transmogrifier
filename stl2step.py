@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stl2step — turn an STL mesh into a real B-rep solid that CAD tools can edit.
+"""stl2step — turn an STL or 3MF mesh into a real B-rep solid that CAD tools can edit.
 
 Pipeline (same idea as Fusion 360's "Mesh to BRep"):
   1. parse STL, weld duplicate vertices, drop degenerate triangles
@@ -57,7 +57,12 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-# ---------------------------------------------------------------- STL parsing
+# ---------------------------------------------------------------- mesh input
+
+def read_mesh(path):
+    """Triangles (N, 3, 3) in mm from an STL or 3MF file."""
+    return read_3mf(path) if Path(path).suffix.lower() == ".3mf" else read_stl(path)
+
 
 def read_stl(path):
     """Return an (N, 3, 3) float64 array of triangle vertices."""
@@ -242,6 +247,77 @@ def write(shape, out, name):
         raise RuntimeError(f"failed to write {out}")
 
 
+_3MF_UNITS = {"micron": 1e-3, "millimeter": 1.0, "centimeter": 10.0, "inch": 25.4,
+              "foot": 304.8, "meter": 1000.0}
+
+
+def read_3mf(path):
+    """Triangles (N, 3, 3) in mm for everything on a 3MF's build plate.
+
+    Follows the core spec: build items reference objects, objects are a mesh or a list of
+    components (other objects, each with a transform), and every transform is a 3x4
+    affine matrix applied to row vectors. Also follows the production extension's p:path
+    (Bambu Studio / OrcaSlicer keep each object in its own file under 3D/Objects/)."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    core = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
+    prod_path = "{http://schemas.microsoft.com/3dmanufacturing/production/2015/06}path"
+
+    def matrix(attr):
+        if not attr:
+            return np.eye(4)
+        v = [float(x) for x in attr.split()]
+        m = np.eye(4)
+        m[:3, :3] = np.array(v[:9]).reshape(3, 3)
+        m[3, :3] = v[9:12]
+        return m
+
+    with zipfile.ZipFile(path) as z:
+        names = {n.lower().lstrip("/"): n for n in z.namelist()}
+        models = {}
+
+        def model(part):
+            part = part.lstrip("/")
+            if part not in models:
+                root = ET.fromstring(z.read(names[part.lower()]))
+                objs = {o.get("id"): o for o in root.iter(core + "object")}
+                models[part] = (root, objs, _3MF_UNITS.get(root.get("unit", "millimeter"), 1.0))
+            return models[part]
+
+        def object_tris(part, oid, xform, depth=0):
+            if depth > 16:
+                raise ValueError("3MF component nesting too deep")
+            _, objs, _ = model(part)
+            obj = objs[oid]
+            mesh = obj.find(core + "mesh")
+            out = []
+            if mesh is not None:
+                verts = np.array([[float(v.get("x")), float(v.get("y")), float(v.get("z"))]
+                                  for v in mesh.iter(core + "vertex")])
+                idx = np.array([[int(t.get("v1")), int(t.get("v2")), int(t.get("v3"))]
+                                for t in mesh.iter(core + "triangle")], dtype=np.int64)
+                if len(idx):
+                    hom = np.c_[verts, np.ones(len(verts))] @ xform
+                    out.append(hom[:, :3][idx])
+            comps = obj.find(core + "components")
+            if comps is not None:
+                for c in comps.iter(core + "component"):
+                    out += object_tris(c.get(prod_path) or part, c.get("objectid"),
+                                       matrix(c.get("transform")) @ xform, depth + 1)
+            return out
+
+        root_part = "3D/3dmodel.model"
+        root, _, unit = model(root_part)
+        tris = []
+        for item in root.find(core + "build").iter(core + "item"):
+            tris += object_tris(item.get(prod_path) or root_part, item.get("objectid"),
+                                matrix(item.get("transform")))
+    if not tris:
+        raise ValueError(f"{path}: no meshes on the build plate")
+    return np.concatenate(tris) * unit
+
+
 def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
             prismatic=True, fit_tol=None, repair_mesh=True, min_cyl_facets=None,
             fix_self_intersections=False):
@@ -249,7 +325,7 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
     out = Path(out) if out else src.with_suffix(".step")
     t0 = time.time()
 
-    tris = read_stl(src)
+    tris = read_mesh(src)
     diag = float(np.linalg.norm(np.ptp(tris.reshape(-1, 3), axis=0)))
     tol = weld_tol or max(diag * 1e-7, 1e-6)
     points, faces, dropped = weld(tris, tol)
@@ -440,7 +516,7 @@ def gui():
     from tkinter import filedialog, scrolledtext, ttk
 
     root = tk.Tk()
-    root.title("STL → STEP")
+    root.title("Mesh → STEP")
     root.geometry("820x420")
 
     merge = tk.BooleanVar(value=True)
@@ -450,7 +526,7 @@ def gui():
 
     bar = ttk.Frame(root, padding=8)
     bar.pack(fill="x")
-    btn = ttk.Button(bar, text="Open STL(s)…")
+    btn = ttk.Button(bar, text="Open mesh(es)…")
     btn.pack(side="left")
     ttk.Checkbutton(bar, text="Merge coplanar faces", variable=merge).pack(side="left", padx=10)
     ttk.Checkbutton(bar, text="Recognise curved surfaces", variable=prismatic).pack(side="left")
@@ -476,19 +552,19 @@ def gui():
         root.after(0, lambda: btn.state(["!disabled"]))
 
     def pick():
-        paths = filedialog.askopenfilenames(filetypes=[("STL mesh", "*.stl *.STL"), ("All", "*")])
+        paths = filedialog.askopenfilenames(filetypes=[("Mesh", "*.stl *.STL *.3mf *.3MF"), ("All", "*")])
         if paths:
             btn.state(["disabled"])
             threading.Thread(target=run, args=(paths,), daemon=True).start()
 
     btn.configure(command=pick)
-    say("Pick one or more STL files; output is written next to each input.")
+    say("Pick one or more STL or 3MF files; output is written next to each input.")
     root.mainloop()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("inputs", nargs="*", help="STL files (no args = open the GUI)")
+    ap.add_argument("inputs", nargs="*", help="STL or 3MF files (no args = open the GUI)")
     ap.add_argument("-o", "--output", help="output file (.step/.stp/.iges/.brep); single input only")
     ap.add_argument("--no-merge", action="store_true", help="keep every triangle as its own face")
     ap.add_argument("--angle", type=float, default=0.5,

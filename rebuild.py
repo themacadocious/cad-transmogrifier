@@ -728,12 +728,15 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     order = sorted(curvedish) + [r for r in index if r not in curvedish]
     blame, poly = set(), set()
 
+    deferred = set()  # invalid planes, left to the whole-solid fix below
+
     def check_curvedish():
         for r, f in made:
             if not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
-                # a bad curved face is its own fault; a bad plane was spoiled by a neighbour
-                blame.update({r} if _is_curved(surfaces[r])
-                             else (x for x in neighbours[r] if _is_curved(surfaces[x])))
+                # a bad curved face is its own fault. A bad plane is left to the whole-solid
+                # fix: blaming its curved neighbours right away would throw out every hole
+                # in a wall over one fixable edge; they only get blamed if that fix fails
+                (blame if _is_curved(surfaces[r]) else deferred).add(r)
         if blame:
             raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
 
@@ -834,6 +837,12 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
         final.Perform()
         out = final.Shape()
         bad_solids = _bad_solids(out, len(solids))
+    if deferred and bad_solids != set():
+        # the solid couldn't be fixed with those planes as they are: now blame their
+        # curved neighbours (the planes themselves get plain polyline edges)
+        raise _ChainError(f"{len(deferred)} planar faces stayed invalid",
+                          tuple(x for r in deferred for x in neighbours[r] if _is_curved(surfaces[x])),
+                          deferred)
     if bad_solids is None:  # ShapeFix changed the body count: let rebuild() check it all
         return out, False
     # a body can come out invalid as a solid even with every face valid (closure,
