@@ -49,7 +49,7 @@ def test_assembly(tmp_path, name, prismatic):
     r.ReadFile(str(out))
     r.TransferRoots()
     shape = r.OneShape()
-    assert stl2step.BRepCheck_Analyzer(shape).IsValid()
+    assert stl2step.rebuild.is_valid(shape)
     assert sum(1 for _ in stl2step._iter_solids(shape)) == want_solids
     # faceted holes lose a little volume to the chords
     assert stl2step.volume(shape) == pytest.approx(want_vol, rel=2e-3)

@@ -198,7 +198,7 @@ def diagnose(points, faces, tol=None):
 # ------------------------------------------------------------------ repair
 
 def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: bool = True,
-           cap_tol: float = None, self_intersections: bool = True):
+           cap_tol: float = None, self_intersections: bool = False):
     """Return (points, faces, notes). `points` (V,3) welded vertices, `faces` (F,3) ints,
     `tol` the weld tolerance. Notes are human-readable lines about what was changed; when
     nothing needed fixing the input arrays are returned unchanged and notes is empty.
@@ -303,13 +303,20 @@ def repair(points: np.ndarray, faces: np.ndarray, tol: float, nested_as_voids: b
             changed = True
             t = _Topo(F, len(P))
 
-    # 4c. self-intersections inside one shell (between shells is fine: fused later)
+    # 4c. self-intersections inside one shell (between shells is fine: fused later).
+    # Always reported; only cut out and re-filled when asked: on real files they are
+    # shallow thread-end crossings, the fix is partial and validity never depended on it
     if self_intersections:
         F, msgs, ch = _fix_self_intersections(P, F, tol)
         notes += msgs
         if ch:
             changed = True
             t = _Topo(F, len(P))
+    else:
+        n_si = len(_self_intersections(P, F, tol))
+        if n_si:
+            notes.append(f"WARNING: {n_si} self-intersecting triangle pairs within a shell "
+                         "(left as is; --fix-self-intersections tries to cut them out)")
 
     # 5. slivers, 6. outward orientation
     F, msgs, ch = _components_pass(P, F, t, diag, nested_as_voids)
@@ -1190,7 +1197,6 @@ def _big_tri_cells(T, s, base, chunk=20000):
         n = np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0])
         k = np.abs(n).argmax(axis=1)
         i, j = (k + 1) % 3, (k + 2) % 3
-        r = np.arange(len(X))
         U = np.take_along_axis(X, i[:, None, None].repeat(3, 1), axis=2)[:, :, 0]
         V = np.take_along_axis(X, j[:, None, None].repeat(3, 1), axis=2)[:, :, 0]
         W = np.take_along_axis(X, k[:, None, None].repeat(3, 1), axis=2)[:, :, 0]

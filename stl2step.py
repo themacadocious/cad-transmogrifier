@@ -27,7 +27,6 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeVertex,
     BRepBuilderAPI_MakeWire,
 )
-from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepTools import BRepTools
@@ -43,6 +42,8 @@ from OCP.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_SHELL, TopAbs_SOLID, TopAb
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Shell, TopoDS_Solid
 from OCP.gp import gp_Dir, gp_Pln, gp_Pnt
+
+import rebuild
 
 
 # OCCT's STEP writer prints transfer statistics to stdout; keep the console clean
@@ -242,7 +243,8 @@ def write(shape, out, name):
 
 
 def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
-            prismatic=True, fit_tol=None, repair_mesh=True, min_cyl_facets=None):
+            prismatic=True, fit_tol=None, repair_mesh=True, min_cyl_facets=None,
+            fix_self_intersections=False):
     src = Path(src)
     out = Path(out) if out else src.with_suffix(".step")
     t0 = time.time()
@@ -256,7 +258,8 @@ def convert(src, out=None, merge=True, angle=0.5, weld_tol=None, progress=log,
     if repair_mesh:  # no-op (and silent) on a clean closed manifold mesh
         import repair
 
-        points, faces, notes = repair.repair(points, faces, tol)
+        points, faces, notes = repair.repair(points, faces, tol,
+                                             self_intersections=fix_self_intersections)
         for n in notes:
             progress("  repair: " + n)
 
@@ -348,7 +351,14 @@ def fuse_overlapping(shape, angle, tol, progress):
             if boxes[i].IsOut(boxes[j]) or find(i) == find(j):
                 continue
             try:
-                common = BRepAlgoAPI_Common(solids[i], solids[j])
+                common = BRepAlgoAPI_Common()
+                pa, pb = List_TopoDS_Shape(), List_TopoDS_Shape()
+                pa.Append(solids[i])
+                pb.Append(solids[j])
+                common.SetArguments(pa)
+                common.SetTools(pb)
+                common.SetRunParallel(True)
+                common.Build()
                 overlap = volume(common.Shape()) if common.IsDone() else 0.0
             except Exception:
                 overlap = 0.0
@@ -376,14 +386,15 @@ def fuse_overlapping(shape, angle, tol, progress):
             for i in g[1:]:
                 tools.Append(solids[i])
             fuse = BRepAlgoAPI_Fuse()
+            fuse.SetRunParallel(True)
             fuse.SetArguments(args)
             fuse.SetTools(tools)
             fuse.Build()
             if fuse.IsDone():
                 # the boolean splits faces along the intersection; merge them back
                 result = merge_coplanar(fuse.Shape(), angle, tol)
-                if not BRepCheck_Analyzer(result).IsValid():
-                    result = fuse.Shape() if BRepCheck_Analyzer(fuse.Shape()).IsValid() else None
+                if not rebuild.is_valid(result):
+                    result = fuse.Shape() if rebuild.is_valid(fuse.Shape()) else None
         except Exception:
             result = None
         if result is None:
@@ -412,7 +423,7 @@ def _iter_solids(shape):
 def _finish(shape, is_solid, src, out, t0, progress, valid=None):
     if is_solid:
         if valid is None:
-            valid = BRepCheck_Analyzer(shape).IsValid()
+            valid = rebuild.is_valid(shape)
         progress(f"  solid volume {volume(shape):.3f} mm^3, "
                  + ("valid" if valid else "WARNING: BRepCheck reports problems"))
 
@@ -490,6 +501,8 @@ def main():
     ap.add_argument("--min-cyl-facets", type=int, metavar="N",
                     help="full-turn shapes with fewer than N facets stay flat-sided prisms "
                          "instead of becoming cylinders (default: decided from the mesh)")
+    ap.add_argument("--fix-self-intersections", action="store_true",
+                    help="cut out and re-fill small self-intersecting areas (default: only warn)")
     ap.add_argument("--no-repair", action="store_true",
                     help="don't fix non-manifold edges, cracks, holes or winding before converting")
     args = ap.parse_args()
@@ -503,7 +516,8 @@ def main():
         try:
             convert(src, args.output, not args.no_merge, args.angle, args.weld,
                     prismatic=not args.faceted, fit_tol=args.fit_tol, repair_mesh=not args.no_repair,
-                    min_cyl_facets=args.min_cyl_facets)
+                    min_cyl_facets=args.min_cyl_facets,
+                    fix_self_intersections=args.fix_self_intersections)
         except Exception as e:
             log(f"{src}: ERROR: {e}")
             rc = 1

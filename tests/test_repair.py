@@ -407,7 +407,7 @@ def test_folded_flap_self_intersection_repaired():
     p[top, 2] = -0.5
     d = repair.diagnose(p, f, TOL)
     assert d["closed_manifold"] and d["self_intersections"] > 0
-    p2, f2, notes = repair.repair(p, f, TOL)
+    p2, f2, notes = repair.repair(p, f, TOL, self_intersections=True)
     d2 = repair.diagnose(p2, f2, TOL)
     assert d2["closed_manifold"] and d2["self_intersections"] == 0, notes
     assert d2["volume"] == pytest.approx(400.0, rel=1e-6)
@@ -435,3 +435,14 @@ def test_large_self_intersection_left_with_warning():
     p2, f2, notes = repair.repair(p, f, TOL)
     assert any("WARNING" in n and "self-intersect" in n for n in notes)
     assert f2 is f                            # nothing changed, only reported
+
+
+def test_self_intersections_warned_not_fixed_by_default():
+    p, f = grid_box()
+    top = np.flatnonzero((np.abs(p[:, 2] - 1) < 1e-9) & (np.abs(p[:, 0] - 10) < 1e-9)
+                         & (np.abs(p[:, 1] - 10) < 1e-9))[0]
+    p = p.copy()
+    p[top, 2] = -0.5
+    p2, f2, notes = repair.repair(p, f, TOL)
+    assert p2 is p and f2 is f
+    assert any(n.startswith("WARNING") and "self-intersecting" in n for n in notes)

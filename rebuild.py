@@ -341,7 +341,7 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
             demote(bad)
             continue
         try:
-            shape = _assemble(points, faces, labels, surfaces, he, chains, tol)
+            shape, verified = _assemble(points, faces, labels, surfaces, he, chains, tol)
             break
         except _ChainError as e:
             curved = [r for r in e.regions if _is_curved(surfaces[r])]
@@ -353,7 +353,7 @@ def rebuild(points, faces, labels, surfaces, tol, max_rounds=20):
     else:
         raise RebuildError("chain classification did not converge")
 
-    if not BRepCheck_Analyzer(shape).IsValid():
+    if not verified and not is_valid(shape):
         raise RebuildError("rebuilt solid fails BRepCheck")
     # a valid compound of open shells still integrates to the right volume, so check
     # explicitly that every face ended up inside a solid
@@ -391,7 +391,8 @@ def _rejoin(shape, tol, angle_deg=0.5, fix_limit=REJOIN_FULL_LIMIT):
         if BRepAdaptor_Surface(TopoDS.Face(f)).GetType() == GeomAbs_Plane:
             keep.Add(f)
         exp.Next()
-    for unify_edges in (True, False):
+    # each attempt costs a full validity check, so big shapes get one try
+    for unify_edges in (True, False) if small else (True,):
         try:
             # on a copy: a merge that throws can leave its input modified in place
             u = ShapeUpgrade_UnifySameDomain(BRepBuilderAPI_Copy(shape).Shape(), unify_edges, True, False)
@@ -409,7 +410,7 @@ def _rejoin(shape, tol, angle_deg=0.5, fix_limit=REJOIN_FULL_LIMIT):
             fix.Perform()
             candidates.append(fix.Shape())
         for m in candidates:
-            if BRepCheck_Analyzer(m).IsValid() and count_solid_faces(m) == count_all_faces(m):
+            if is_valid(m) and count_solid_faces(m) == count_all_faces(m):
                 return m
     return shape
 
@@ -510,20 +511,53 @@ def _split_sphere(points, faces, labels, surfaces, r, max_angle=np.radians(70), 
 
 def _build_chains(points, faces, labels, surfaces, he, tol, poly_regions=frozenset()):
     """Group boundary edges into chains and classify them. Returns (chains, regions_to_demote)."""
-    # undirected boundary edges keyed by the (sorted) region pair
-    pair_edges = defaultdict(list)
-    vert_regions = defaultdict(set)
-    for (a, b), (t, _) in he.items():
-        if a > b:
-            continue
-        ra, rb = int(labels[t]), int(labels[he[(b, a)][0]])
-        if ra != rb:
-            pair_edges[(min(ra, rb), max(ra, rb))].append((a, b))
-            vert_regions[a].update((ra, rb))
-            vert_regions[b].update((ra, rb))
-    corners = {v for v, rs in vert_regions.items() if len(rs) >= 3}
+    # every undirected edge once (a < b), with the regions on either side — vectorised,
+    # since a freeform mesh has a region boundary on nearly every edge
+    F = np.asarray(faces)
+    a = F.ravel()
+    b = np.roll(F, -1, axis=1).ravel()
+    tri = np.repeat(np.arange(len(F)), 3)
+    fwd = a < b
+    # the twin half-edge (b, a) belongs to the triangle on the other side
+    key_f = a[fwd].astype(np.int64) * len(points) + b[fwd]
+    key_r = b[~fwd].astype(np.int64) * len(points) + a[~fwd]
+    of, orv = np.argsort(key_f, kind="stable"), np.argsort(key_r, kind="stable")
+    if len(of) != len(orv) or not np.array_equal(key_f[of], key_r[orv]):
+        raise RebuildError("mesh is not watertight")
+    ea, eb = a[fwd][of], b[fwd][of]
+    ra = labels[tri[fwd][of]]
+    rb = labels[tri[~fwd][orv]]
+    bnd = ra != rb
+    ea, eb, ra, rb = ea[bnd], eb[bnd], ra[bnd], rb[bnd]
+    lo, hi = np.minimum(ra, rb), np.maximum(ra, rb)
 
-    chains, demote = [], set()
+    # corners: vertices touching three or more regions
+    vr = np.concatenate([np.c_[ea, ra], np.c_[ea, rb], np.c_[eb, ra], np.c_[eb, rb]])
+    vr = vr[np.lexsort((vr[:, 1], vr[:, 0]))]
+    first = np.r_[True, (np.diff(vr, axis=0) != 0).any(axis=1)]
+    v_ids = vr[first, 0]
+    starts = np.r_[True, v_ids[1:] != v_ids[:-1]]
+    counts = np.diff(np.r_[np.flatnonzero(starts), len(v_ids)])
+    corners = set(v_ids[starts][counts >= 3].tolist())
+
+    # group edges by region pair; a pair sharing one edge between two non-curved regions
+    # (two facets, a facet and a plane...) is a one-edge straight chain: no walk, no fit
+    order = np.lexsort((hi, lo))
+    lo, hi, ea, eb = lo[order], hi[order], ea[order], eb[order]
+    gstart = np.flatnonzero(np.r_[True, (lo[1:] != lo[:-1]) | (hi[1:] != hi[:-1])])
+    gend = np.r_[gstart[1:], len(lo)]
+    curved = np.array([_is_curved(x) for x in surfaces], bool)
+    chains = []
+    pair_edges = {}
+    for s0, s1 in zip(gstart.tolist(), gend.tolist()):
+        pair = (int(lo[s0]), int(hi[s0]))
+        if s1 - s0 == 1 and not curved[pair[0]] and not curved[pair[1]]:
+            chains.append([pair, [int(ea[s0]), int(eb[s0])], ("line",)])
+        else:
+            pair_edges[pair] = list(zip(ea[s0:s1].tolist(), eb[s0:s1].tolist()))
+    n_simple = len(chains)
+
+    demote = set()
     for pair, edges in pair_edges.items():
         adj = defaultdict(list)
         for a, b in edges:
@@ -551,7 +585,7 @@ def _build_chains(points, faces, labels, surfaces, he, tol, poly_regions=frozens
             if (min(a, b), max(a, b)) not in seen:
                 chains.append([pair, walk(a, b)])
 
-    for ch in chains:
+    for ch in chains[n_simple:]:
         (ra, rb), path = ch
         closed = path[0] == path[-1]
         geom = _chain_geom(points[path], surfaces[ra], surfaces[rb], tol, closed)
@@ -771,35 +805,52 @@ def _faces_and_solid(points, faces, labels, surfaces, he, chains, chain_edges, h
     if blame:
         raise _ChainError(f"{len(blame)} curved faces came out invalid", tuple(blame))
 
-    final = ShapeFix_Shape(solid)
-    final.Perform()
-    out = final.Shape()
-
+    # each body is checked once; the whole-shape ShapeFix (seconds on big meshes) only
+    # runs if a body actually needs it
+    out = solid
+    bad_solids = _bad_solids(out, len(solids))
+    if bad_solids:
+        final = ShapeFix_Shape(solid)
+        final.Perform()
+        out = final.Shape()
+        bad_solids = _bad_solids(out, len(solids))
+    if bad_solids is None:  # ShapeFix changed the body count: let rebuild() check it all
+        return out, False
     # a body can come out invalid as a solid even with every face valid (closure,
     # orientation); demote that body's curved regions rather than lose every body
+    bad_bodies = {b for b, i in solid_of.items() if i in bad_solids}
+    if bad_bodies:
+        # usually a thin planar face whose straightened edges collapsed: find the bad
+        # faces; planes get polyline edges, curved faces (and a bad plane's curved
+        # neighbours) get demoted
+        for r, f in made:
+            if region_body[r] in bad_bodies and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
+                if _is_curved(surfaces[r]):
+                    blame.add(r)
+                else:
+                    poly.add(r)
+                    blame.update(x for x in neighbours[r] if _is_curved(surfaces[x]))
+        if not blame and not poly:  # nothing face-level to blame: drop its curves
+            blame = {r for r, b in region_body.items() if b in bad_bodies and _is_curved(surfaces[r])}
+        raise _ChainError(f"{len(bad_bodies)} bodies came out invalid", tuple(blame), poly)
+    return out, True
+
+
+def _bad_solids(shape, expected):
+    """Indices of invalid solids, or None if the shape doesn't have `expected` solids."""
     built = []
-    exp = TopExp_Explorer(out, TopAbs_SOLID)
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
     while exp.More():
         built.append(exp.Current())
         exp.Next()
-    if len(built) == len(solids):
-        bad_solids = {i for i, so in enumerate(built) if not BRepCheck_Analyzer(so).IsValid()}
-        bad_bodies = {b for b, i in solid_of.items() if i in bad_solids}
-        if bad_bodies:
-            # usually a thin planar face whose straightened edges collapsed: find the bad
-            # faces; planes get polyline edges, curved faces (and a bad plane's curved
-            # neighbours) get demoted
-            for r, f in made:
-                if region_body[r] in bad_bodies and not BRepCheck_Analyzer(reshape.Value(f)).IsValid():
-                    if _is_curved(surfaces[r]):
-                        blame.add(r)
-                    else:
-                        poly.add(r)
-                        blame.update(x for x in neighbours[r] if _is_curved(surfaces[x]))
-            if not blame and not poly:  # nothing face-level to blame: drop its curves
-                blame = {r for r, b in region_body.items() if b in bad_bodies and _is_curved(surfaces[r])}
-            raise _ChainError(f"{len(bad_bodies)} bodies came out invalid", tuple(blame), poly)
-    return out
+    if len(built) != expected:
+        return None
+    return {i for i, so in enumerate(built) if not is_valid(so)}
+
+
+def is_valid(shape):
+    """BRepCheck of a whole shape, multithreaded (it dominates on 10k+ face shapes)."""
+    return BRepCheck_Analyzer(shape, True, True).IsValid()
 
 
 def _count(shape, kind):
