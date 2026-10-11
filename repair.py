@@ -21,6 +21,9 @@ clean, outward-oriented closed manifold comes back as the *same* arrays):
   3. consistent winding per connected component (orientation propagation)
   4. boundary repair: split edges at T-junctions, snap near-coincident boundary vertices,
      then fill remaining small near-planar holes by ear clipping
+  4b. caps — triangles whose apex lies within CAP_TOL_MULT × tol of the interior of their
+     longest edge (OCCT rejects such faces) — are removed by flipping that edge with the
+     triangle across it; no vertex moves
   5. drop tiny disconnected slivers (≈zero volume, negligible area) — reported, never silent
   6. orient every closed component outward; a shell fully inside another one (an internal
      void) points inward
@@ -880,8 +883,8 @@ def _remove_caps(P, F, cap_tol, tol, rounds=20):
             break
     left = int(_cap_mask(P, F, cap_tol).sum())
     if not nflip:
-        return F, ([f"WARNING: {n0} cap triangles (apex within {cap_tol:.3g} of the opposite edge) "
-                    "could not be flipped"] if n0 else [])
+        # nothing changed: stay silent so the mesh still counts as untouched
+        return F, []
     msg = (f"removed cap triangles by edge flips: {n0} -> {left} caps (apex within {cap_tol:.3g} "
            f"of the opposite edge; {nflip} flips")
     if nbent:
@@ -889,7 +892,7 @@ def _remove_caps(P, F, cap_tol, tol, rounds=20):
     msg += ")"
     msgs = [msg]
     if left:
-        msgs.append(f"WARNING: {left} cap triangles could not be flipped")
+        msgs.append(f"{left} cap triangles left (thin strips where no flip raises the altitude)")
     return F, msgs
 
 

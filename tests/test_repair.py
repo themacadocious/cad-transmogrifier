@@ -265,3 +265,54 @@ def test_large_open_hole_reported_not_filled():
     f = np.delete(f, [2, 3, 4, 5], axis=0)
     p2, f2, notes = repair.repair(p, f, TOL)
     assert any("WARNING" in n and "open" in n for n in notes)
+
+
+# ---------------------------------------------------------------- cap triangles
+
+def cap_box(eps):
+    """Unit box whose top face has a cap: vertex c sits eps off the 4-6 diagonal, so
+    triangle (4,c,6) has its apex almost on its longest edge."""
+    p, f = box()
+    p = np.vstack([p, [[0.5 + eps, 0.5 - eps, 1]]])          # c = 8
+    top = [i for i, t in enumerate(f.tolist()) if t == [4, 5, 6]][0]
+    f = np.vstack([np.delete(f, top, axis=0), [[4, 5, 8], [5, 6, 8], [4, 8, 6]]])
+    return p, f
+
+
+def test_cap_flipped_coplanar():
+    p, f = cap_box(1e-7)
+    d = repair.diagnose(p, f, TOL)
+    assert d["closed_manifold"] and d["caps"] == 1
+    p2, f2, notes = repair.repair(p, f, TOL)
+    d2 = check(p2, f2, 1.0, shells=1)
+    assert d2["caps"] == 0
+    assert any("cap" in n and "1 -> 0" in n for n in notes)
+    assert np.array_equal(p2, p)               # a flip moves no vertex
+    assert_solid(p2, f2, 1.0)
+
+
+def test_cap_across_crease_reported():
+    # front face (y=0) has c just below the top edge 4-5: the cap's neighbour across 4-5
+    # is on the top face, so the flip bends the surface by eps (reported)
+    eps = 5e-6
+    p, f = box()
+    p = np.vstack([p, [[0.5, 0, 1 - eps]]])                  # c = 8
+    f = np.vstack([np.delete(f, [5], axis=0), [[0, 5, 8], [0, 8, 4], [8, 5, 4]]])
+    assert repair.diagnose(p, f, TOL)["caps"] == 1
+    p2, f2, notes = repair.repair(p, f, TOL)
+    d = check(p2, f2, repair.diagnose(p2, f2)["volume"], shells=1)
+    assert d["caps"] == 0 and d["volume"] == pytest.approx(1.0, abs=1e-5)
+    assert any("crease" in n for n in notes)
+
+
+def test_cap_tol_zero_disables():
+    p, f = cap_box(1e-7)
+    p2, f2, notes = repair.repair(p, f, TOL, cap_tol=0)
+    assert notes == [] and f2 is f
+
+
+def test_fat_triangle_is_not_a_cap():
+    p, f = cap_box(1e-3)                       # 1.4e-3 off the diagonal: a real triangle
+    assert repair.diagnose(p, f, TOL)["caps"] == 0
+    p2, f2, notes = repair.repair(p, f, TOL)
+    assert notes == [] and f2 is f
