@@ -1,25 +1,87 @@
 # stl2step
 
-Converts STL and 3MF meshes into real B-rep solids (STEP/IGES/BREP) that CAD programs can edit —
-like Fusion 360's "Mesh to BRep" with the prismatic option, built on OpenCASCADE
-(`cadquery-ocp`).
+Turn an STL or 3MF mesh into a real, editable solid — a STEP file you can open in
+**FreeCAD**, **Onshape** or any other CAD program and actually work with: select a hole
+and change its diameter, sketch on a flat face, add fillets, cut it with booleans.
+
+```
+./stl2step Orin_nano_case_main.3MF
+Orin_nano_case_main.3MF: 3304 triangles, 1612 vertices
+  prismatic: 77 cone, 47 cylinder, 334 plane faces
+  solid volume 76673.817 mm^3, valid
+  wrote Orin_nano_case_main.step (1.6 MB) in 1.6s
+```
+
+3,304 triangles became 458 faces: the screw holes and slot ends are true cylinders at
+their design radii (1.25 / 2.25 / 2.6 / 3.0 mm), the chamfers are exact 45° cones, every
+flat wall is one face.
+
+## Why this exists
+
+Fusion 360 has the best mesh-to-solid workflow I've used: import an STL or 3MF, convert
+it to a B-rep with the *prismatic* option, and you get real cylinders and planes you can
+edit. But Fusion 360 doesn't run well on Linux, costs a decent amount of money, and wants
+your files saved to Autodesk's cloud first. Every other tool I tried (FreeCAD included)
+just imports the mesh as a mesh — at best a "solid" made of thousands of triangles that
+you can't meaningfully edit.
+
+stl2step is that one conversion step, offline, free, on Linux: mesh in, editable STEP
+out, then do the actual CAD work in FreeCAD or Onshape. It is not affiliated with
+Autodesk.
+
+## Made with AI — vibe-coded with Claude
+
+Up front: this project was **vibe-coded**. The code, the tests and most of this README
+were written by Anthropic's Claude (Claude Code, with a few parallel sub-agents working on
+segmentation, mesh repair and the test corpus), directed and tested by me on my own
+printer files. Commits carry `Co-Authored-By: Claude` trailers.
+
+What that means for you:
+- It works on the files I've thrown at it (a ground-truth test corpus plus ~70 real
+  STL/3MF downloads), and every output is checked by OpenCASCADE's validator and against
+  the mesh volume before it's written — but it has not been reviewed line by line by a
+  human CAD-kernel expert.
+- If a conversion looks wrong, `--faceted` gives the plain, conservative result, and
+  issues with the offending file attached are very welcome.
+
+## Install (Linux)
+
+Needs Python 3.11+ (tested on 3.13, Debian 13). Everything else comes from pip —
+OpenCASCADE via [`cadquery-ocp`](https://pypi.org/project/cadquery-ocp/), plus numpy and
+scipy.
+
+```bash
+git clone https://github.com/themacadocious/stl2step.git
+cd stl2step
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+./stl2step part.stl
+```
+
+## Usage
 
     ./stl2step part.stl                 # -> part.step next to it
     ./stl2step case.3mf                 # 3MF works too (PrusaSlicer, Bambu Studio, Orca)
     ./stl2step *.stl                    # batch
-    ./stl2step part.stl -o part.iges
-    ./stl2step                          # GUI with file picker
+    ./stl2step part.stl -o part.iges    # .step/.stp, .iges/.igs or .brep
+    ./stl2step                          # small GUI with a file picker
+
+Then in FreeCAD: *File → Import* the `.step`; in Onshape: *Import* it into a Part Studio.
 
 Options:
-- `--faceted` — skip surface recognition; only merge coplanar triangles
+- `--faceted` — skip surface recognition; only merge coplanar triangles (safest)
 - `--fit-tol MM` — how far a vertex may sit from a plane/cylinder and still belong to it
   (default: 2e-5 × bounding-box diagonal, at least 0.001 mm)
 - `--angle DEG` — max angle between triangles merged into one flat face (default 0.5)
+- `--min-cyl-facets N` — full-turn shapes with fewer than N facets stay flat-sided prisms
+  (default: decided from the mesh; 0 = always cylinders)
+- `--no-repair` — skip mesh repair
+- `--fix-self-intersections` — cut out and re-fill small self-intersecting areas
+  (default: only warn)
 - `--no-merge` — one face per triangle
 - `--weld MM` — vertex weld tolerance
-- `--no-repair` — skip mesh repair
 
-Setup: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+Units: STL has none — it's treated as millimetres, like slicers do. 3MF units are honoured.
 
 ## What you get
 
@@ -79,3 +141,7 @@ with per-triangle labels) — see `tests/README.md`.
   and needle triangles, and small self-intersections; larger self-intersecting areas
   (e.g. crossing thread flanks) are left in place with a warning. It may make tiny,
   reported edge flips even on otherwise clean meshes. `--no-repair` skips it.
+
+## License
+
+LGPL-2.1, the same family as the OpenCASCADE kernel it is built on. See `LICENSE`.
