@@ -1,9 +1,14 @@
 .venv/
 __pycache__/
-*.step
-*.stp
-*.iges
-*.igs
-*.brep
-*.stl
+# meshes and CAD output stay out of the repo, in any case (Part.STL, Case.STEP):
+# the only models here are the generated test corpus
+*.[sS][tT][eE][pP]
+*.[sS][tT][pP]
+*.[iI][gG][eE][sS]
+*.[iI][gG][sS]
+*.[bB][rR][eE][pP]
+*.[sS][tT][lL]
+*.3[mM][fF]
+*.[oO][bB][jJ]
+*.[pP][lL][yY]
 !tests/corpus/*.stl
